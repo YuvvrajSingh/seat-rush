@@ -59,3 +59,10 @@ Issues live in GitHub Issues for `YuvvrajSingh/seat-rush`, via the `gh` CLI. See
 ### Domain docs
 
 Single-context: one `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Frontend and visuals
+
+- Any UI work: run `unslop` (audit, then direction, then passes) together with `frontend-design`, `web-design-guidelines` and `react-best-practices`. A screen isn't done until it passes the unslop audit.
+- WebGL: `threejs-react-three-fiber` first, plus `threejs-shaders`, `threejs-postprocessing`, `threejs-performance` and `threejs-interaction` as needed. Every visual event must come from a real backend event (prd §9), and every canvas needs an accessible DOM equivalent and a reduced-motion path.
+- Bitmap assets: `imagegen` (OpenAI gpt-image), run through the Codex CLI's built-in image tool (`codex exec`, ChatGPT login; no API key needed). Show the prompt and get approval before generating. Final assets go in `apps/web/public/` with their prompts recorded in `docs/assets.md`.
+- Third-party skill licenses: `unslop` is CC BY 4.0 (Damir Sokolovsky, github.com/heydamir/unslop); three.js skills are MIT (`.agents/skills/LICENSE.threejs-skills`); Matt Pocock skills are MIT (`.agents/skills/LICENSE.mattpocock`).
