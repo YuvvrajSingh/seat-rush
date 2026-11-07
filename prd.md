@@ -1,6 +1,6 @@
 # Product Requirements Document: SeatRush
 
-**Version:** 1.1  
+**Version:** 1.2  
 **Product:** Cinema booking system with a live concurrency visualization  
 **Scope:** Portfolio project demonstrating backend correctness, testing, and reliability
 
@@ -220,7 +220,27 @@ Updates should use server-sent events, with periodic snapshot reconciliation aft
 
 The frontend must reflect actual backend outcomes. Animations must not invent successful purchases or reservation conflicts.
 
-Under normal demo conditions, state changes should appear within two seconds. This is a target to verify, not a preclaimed result.
+Under normal demo conditions, state changes should appear within two seconds. This is a target to verify, not a preclaimed result. The dashboard measures and displays display lag (server event time to applied on screen) as a real metric.
+
+### Live event contract
+
+The visualization is only as honest as the events it receives. The backend must provide:
+
+- **Seat-attributed events.** Every seat-affecting event (hold created, released, expired; payment initiated, failed, succeeded; booking confirmed; refund required) carries the screening, affected seat identifiers, hold identifier, a database-clock timestamp, and a monotonically increasing event identifier used as the SSE `id` for `Last-Event-ID` resume. Hold events also carry `expiresAt`. Ownership relative to the viewer ("held by you") is computed per authenticated subscriber, never broadcast as customer identity.
+- **Conflict channel.** Rejected hold requests are not ownership changes and are not written to the ownership outbox, but they are published as events naming only the seats that actually conflicted, aggregated per seat over short windows (for example 100 ms) with exact counts.
+- **Snapshot endpoint.** Returns every seat's state, active holds with expiry, payment state per hold, the last event identifier included, and the server's current time, so clients reconcile after connect or reconnect and correct for clock skew. SSE heartbeats also carry server time.
+- **Run history endpoint.** Returns the ordered events of a simulation run, used to rebuild per-seat history and to replay a recorded run.
+
+Events are deduplicated by identifier. A client countdown reaching zero means "awaiting server", never "available".
+
+### Seat map rendering
+
+The seat map has two layers driven by one client-side seat-state store, which changes only by applying server events or snapshots:
+
+- **Accessible DOM grid** (always present): the customer selection surface, keyboard operable, with text or symbol for every state. On the dashboard it is accompanied by a per-seat state table and a timestamped event log.
+- **WebGL layer** (progressive enhancement, dashboard and home hero only): a flat live plan drawn with one instanced draw, showing hold timers, payment progress, and conflict tallies; after a run settles, a **core sample** view tilts the plan so each seat becomes a column of its run history (holds, payments, conflicts, expiries, refund markers) ending in at most one confirmed cap.
+
+The canvas is hidden from assistive technology, renders only on change, uses no post-processing, honours reduced motion, and falls back to the DOM grid when WebGL2 is unavailable, the context is lost, or frame budgets are missed. A replay is shown only for a real recorded run, labelled with its run identifier, seed, and commit.
 
 ## 10. Simulation requirements
 
@@ -261,7 +281,7 @@ Stopping a run stops new simulated activity. Existing requests and holds must se
 
 Start with one API application and one background worker.
 
-**Pinned versions (checked 2026-11-07):** Node.js 24 LTS, TypeScript 6.0, Next.js 16.4, Express 5.3, Prisma 7.10 (not the 8.0 release candidate), BullMQ 6.7, Redis 8, PostgreSQL 18, Vitest 5.1, k6 2.3, pnpm workspaces.
+**Pinned versions (checked 2026-11-07):** Node.js 24 LTS, TypeScript 6.0, Next.js 16.4, React 19.3, Tailwind CSS 4, three.js 0.187 with React Three Fiber 9.8 and drei 10.7 (dashboard and home hero only, loaded lazily), Express 5.3, Prisma 7.10 (not the 8.0 release candidate), BullMQ 6.7, Redis 8, PostgreSQL 18, Vitest 5.1, k6 2.3, pnpm workspaces.
 
 Concurrency-critical statements (conditional seat claims, row locks) use raw SQL inside Prisma-managed SQL migrations and `$transaction`, not the generic query builder.
 
@@ -325,10 +345,10 @@ The final deliverables are a working demo, source repository, API documentation,
 
 | Phase | Deliverable |
 |---|---|
-| Week 1 | Schema, screening, seat map, atomic holds |
-| Week 2 | Expiry, ownership checks, idempotency |
-| Week 3 | Payment simulation, confirmation, refund handling |
-| Week 4 | Dashboard, event stream, load generator |
+| Week 1 | Schema, screening, accessible DOM seat map, atomic holds, snapshot endpoint, seat-attributed hold events |
+| Week 2 | Expiry, ownership checks, idempotency, conflict channel |
+| Week 3 | Payment simulation, confirmation, refund handling, seat-attributed payment and booking events |
+| Week 4 | Dashboard, event stream, load generator, WebGL live plan, run history endpoint, core sample view |
 | Weeks 5–6 | Failure tests, deployment, benchmarks, documentation |
 
 **Release criterion:** All correctness acceptance tests pass. Any unmet performance targets or unsupported recovery scenarios are documented explicitly.
