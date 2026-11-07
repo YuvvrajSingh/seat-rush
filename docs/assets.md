@@ -6,7 +6,7 @@ Not generated, by decision: home hero photo (the hero is the live WebGL plan), s
 
 ## ticket-stub
 
-- **File:** `apps/web/public/images/ticket-stub.png`
+- **File:** `apps/web/public/images/ticket-stub.webp` (1200×800, generated 2026-11-07; matches the prompt).
 - **Used on:** booking confirmation screen (FR-07), with booking reference, seats, amount and time laid over it in HTML. The printable ticket itself is HTML/CSS.
 - **Prompt:**
 
@@ -27,7 +27,7 @@ Avoid: gold foil, holographic effects, stars, film reels, popcorn, tilt, curl, g
 
 ## hold-expired
 
-- **File:** `apps/web/public/images/hold-expired.png`
+- **File:** `apps/web/public/images/hold-expired.webp` (720×720, generated 2026-11-07). The cushion came out folded down rather than sprung up; kept because the image is quiet and on-palette. Regenerate if the metaphor matters.
 - **Used on:** customer booking page, beside the message that the hold expired and the seats are available again. The upholstery deliberately matches the available-seat colour.
 - **Prompt:**
 
@@ -48,7 +48,7 @@ Avoid: red velvet, gold trim, haze or light beams, lens flare, popcorn, drinks, 
 
 ## social-cover
 
-- **File:** `apps/web/public/images/social-cover.png` (photographic layer); the title is composited in code for the 1200×630 Open Graph image.
+- **File:** `apps/web/public/images/social-cover.webp` (1200×628 crop, generated 2026-11-07), the photographic layer; the title is composited in code for the Open Graph image.
 - **Used on:** Open Graph / social preview until Week 4, when the cover can be rendered from a real recorded run instead.
 - **Prompt:**
 
