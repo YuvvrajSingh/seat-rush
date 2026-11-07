@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Bundler-style resolution for tsc (implied by "Preserve"). moduleResolution is reset rather than set to
+    // "Bundler": Turbopack only maps NodeNext-style "./x.js" imports (used throughout @seatrush/shared) to
+    // "./x.ts" when moduleResolution is not explicitly "bundler".
+    "module": "Preserve",
+    "moduleResolution": null,
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["node"],
+    "noEmit": true,
+    "declaration": false,
+    "sourceMap": false,
+    "incremental": true,
+    "plugins": [{ "name": "next" }]
+  },
+  "include": ["next-env.d.ts", "src", "tests", "*.ts", ".next/types/**/*.ts", ".next/dev/types/**/*.ts"],
+  "exclude": ["node_modules", ".next"]
+}

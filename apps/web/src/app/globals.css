@@ -1,0 +1,215 @@
+@import "tailwindcss";
+
+/*
+  SeatRush design tokens.
+  The page is the lobby: light when the house lights are up, dark when they are down.
+  The hall is always an auditorium, dark in both schemes, so seat states read the same everywhere.
+*/
+
+:root {
+  color-scheme: light dark;
+
+  /* Lobby (page chrome), light scheme */
+  --paper: #eceef4;
+  --paper-raised: #f7f8fb;
+  --ink: #1b1530;
+  --ink-muted: #4a4560;
+  --rule: #c9ccd8;
+  --accent: #a0153e;
+  --accent-ink: #ffffff;
+
+  /* Status signals (text/icon colors on --paper) */
+  --signal-ok: #1b6e45;
+  --signal-warn: #8a5300;
+  --signal-down: #a0153e;
+
+  /* Auditorium */
+  --hall: #1f1229;
+  --hall-edge: #3a2648;
+  --hall-ink: #ece5f3;
+  --hall-ink-muted: #b3a6c2;
+  --screen-light: #dce6ff;
+
+  /* Seat states (FR-01). Each is paired with a glyph and text label. */
+  --seat-available: #9a8aae;
+  --seat-available-ink: #d8cee4;
+  --seat-mine: #ffb938;
+  --seat-mine-ink: #1f1229;
+  --seat-held: #7d8af0;
+  --seat-held-ink: #e3e7ff;
+  --seat-confirmed: #d6335f;
+  --seat-confirmed-ink: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #12141c;
+    --paper-raised: #1a1d28;
+    --ink: #eceaf2;
+    --ink-muted: #a9a6b8;
+    --rule: #2e3140;
+    --accent: #ffb938;
+    --accent-ink: #1f1229;
+
+    --signal-ok: #5bd69a;
+    --signal-warn: #ffc65c;
+    --signal-down: #ff7a98;
+
+    --hall: #1a0f22;
+    --hall-edge: #3f2a4f;
+  }
+}
+
+@theme inline {
+  --font-display: var(--font-big-shoulders), "Arial Narrow", sans-serif;
+  --font-sans: var(--font-atkinson), ui-sans-serif, system-ui, sans-serif;
+
+  --color-paper: var(--paper);
+  --color-paper-raised: var(--paper-raised);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-rule: var(--rule);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-signal-ok: var(--signal-ok);
+  --color-signal-warn: var(--signal-warn);
+  --color-signal-down: var(--signal-down);
+  --color-hall: var(--hall);
+  --color-hall-edge: var(--hall-edge);
+  --color-hall-ink: var(--hall-ink);
+  --color-hall-ink-muted: var(--hall-ink-muted);
+  --color-screen-light: var(--screen-light);
+}
+
+@theme {
+  /* Bringhurst's classic type scale: 12 14 16 18 21 24 36 48 60 72 96 px */
+  --text-xs: 0.75rem;
+  --text-xs--line-height: 1.4;
+  --text-sm: 0.875rem;
+  --text-sm--line-height: 1.45;
+  --text-base: 1rem;
+  --text-base--line-height: 1.55;
+  --text-lg: 1.125rem;
+  --text-lg--line-height: 1.55;
+  --text-xl: 1.3125rem;
+  --text-xl--line-height: 1.4;
+  --text-2xl: 1.5rem;
+  --text-2xl--line-height: 1.3;
+  --text-3xl: 2.25rem;
+  --text-3xl--line-height: 1.05;
+  --text-4xl: 3rem;
+  --text-4xl--line-height: 0.95;
+  --text-5xl: 3.75rem;
+  --text-5xl--line-height: 0.96;
+  --text-6xl: 4.5rem;
+  --text-6xl--line-height: 0.94;
+  --text-7xl: 6rem;
+  --text-7xl--line-height: 0.88;
+  /* Fluid headline: the longest line ("Every seat sold once.") is ~7.8em wide in Big Shoulders. */
+  --text-display: clamp(2rem, 10.4vw, 4.5rem);
+  --text-display--line-height: 0.95;
+  --text-display-split: clamp(3rem, 4.6vw, 4.5rem);
+  --text-display-split--line-height: 0.95;
+
+  /* Spacing: Tailwind's 4px step, plus named layout rhythm */
+  --spacing: 0.25rem;
+  --spacing-gutter: clamp(1.25rem, 4vw, 3rem);
+
+  --radius-seat: 0.55em 0.55em 0.2em 0.2em;
+}
+
+/*
+  Seat geometry is inlined into each utility so `cqi` and the hall variables resolve on the seat itself.
+  A seat takes a tenth of what the hall's width leaves after the fixed row parts (see .hall-plan),
+  capped by viewport height so the whole hall fits one screen.
+*/
+@theme inline {
+  --spacing-seat: clamp(0.875rem, min(calc((100cqi - var(--hall-overhead, 0px)) / 10), 3.6dvh), 2.25rem);
+  --spacing-seat-gap: var(--hall-seat-gap, 0.375rem);
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    background-color: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-feature-settings: "kern";
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  ::selection {
+    background-color: var(--accent);
+    color: var(--accent-ink);
+  }
+}
+
+/* Fixed parts of a hall row: two row letters, four row gaps, the aisle and eight seat gaps. */
+.hall-plan {
+  --hall-letter: 0.75rem;
+  --hall-row-gap: 0.375rem;
+  --hall-aisle: 0.375rem;
+  --hall-seat-gap: 0.1875rem;
+  --hall-overhead: calc(
+    2 * var(--hall-letter) + 4 * var(--hall-row-gap) + var(--hall-aisle) + 8 * var(--hall-seat-gap)
+  );
+}
+
+@media (width >= 40rem) {
+  .hall-plan {
+    --hall-letter: 1rem;
+    --hall-row-gap: 0.75rem;
+    --hall-aisle: 1rem;
+    --hall-seat-gap: 0.375rem;
+  }
+}
+
+/* Held by another customer: diagonal hatching, so the state survives without colour. */
+.seat-hatch {
+  background-image: repeating-linear-gradient(
+    135deg,
+    color-mix(in oklab, var(--seat-held) 32%, transparent) 0 2px,
+    transparent 2px 7px
+  );
+}
+
+/* House lights dim: seats appear row by row from the screen back. The only page-load motion. */
+@keyframes seat-in {
+  from {
+    opacity: 0;
+    transform: translateY(-0.25rem);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes screen-warm {
+  from {
+    opacity: 0.2;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .seat-row {
+    animation: seat-in 420ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+    animation-delay: calc(var(--row-index) * 45ms + 120ms);
+  }
+
+  .screen-glow {
+    animation: screen-warm 700ms ease-out both;
+  }
+}

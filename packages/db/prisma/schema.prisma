@@ -1,0 +1,231 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Identity {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  demoKey     String   @unique @map("demo_key")
+  displayName String   @map("display_name")
+  role        String
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  holds       Hold[]
+  bookings    Booking[]
+  idempotencyRecords IdempotencyRecord[]
+  simulationRuns SimulationRun[]
+
+  @@map("identities")
+}
+
+model Screening {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  demoKey         String?  @unique @map("demo_key")
+  title           String
+  startsAt        DateTime @map("starts_at") @db.Timestamptz(6)
+  durationMinutes Int      @map("duration_minutes")
+  seatPricePaise  Int      @map("seat_price_paise")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  seats           Seat[]
+  holds           Hold[]
+  bookings        Booking[]
+  simulationRuns  SimulationRun[]
+  domainEvents    DomainEvent[]
+  idempotencyRecords IdempotencyRecord[]
+
+  @@map("screenings")
+}
+
+model Seat {
+  id            String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  screeningId   String  @map("screening_id") @db.Uuid
+  label         String
+  row           String
+  number        Int
+  currentHoldId String? @map("current_hold_id") @db.Uuid
+  screening     Screening @relation(fields: [screeningId], references: [id], onUpdate: Restrict)
+  currentHold   Hold? @relation("CurrentHold", fields: [currentHoldId, screeningId], references: [id, screeningId], onUpdate: Restrict)
+  holdItems     HoldItem[]
+  bookedSeats   BookedSeat[]
+
+  @@unique([screeningId, label])
+  @@unique([screeningId, row, number])
+  @@unique([id, screeningId])
+  @@index([currentHoldId])
+  @@map("seats")
+}
+
+model Hold {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  screeningId  String   @map("screening_id") @db.Uuid
+  customerId   String   @map("customer_id") @db.Uuid
+  status       String   @default("active")
+  seatCount    Int      @map("seat_count")
+  amountPaise  Int      @map("amount_paise")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt    DateTime @default(dbgenerated("(now() + '00:05:00'::interval)")) @map("expires_at") @db.Timestamptz(6)
+  screening    Screening @relation(fields: [screeningId], references: [id], onUpdate: Restrict)
+  customer     Identity @relation(fields: [customerId], references: [id], onUpdate: Restrict)
+  currentSeats Seat[] @relation("CurrentHold")
+  items        HoldItem[]
+  booking      Booking?
+  paymentAttempts PaymentAttempt[]
+
+  @@unique([id, screeningId])
+  @@unique([id, screeningId, customerId])
+  @@index([status, expiresAt])
+  @@index([customerId])
+  @@map("holds")
+}
+
+model HoldItem {
+  holdId      String @map("hold_id") @db.Uuid
+  seatId      String @map("seat_id") @db.Uuid
+  screeningId String @map("screening_id") @db.Uuid
+  pricePaise  Int    @map("price_paise")
+  hold        Hold @relation(fields: [holdId, screeningId], references: [id, screeningId], onUpdate: Restrict)
+  seat        Seat @relation(fields: [seatId, screeningId], references: [id, screeningId], onUpdate: Restrict)
+
+  @@id([holdId, seatId])
+  @@index([seatId])
+  @@map("hold_items")
+}
+
+model Booking {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reference        String   @unique @default(dbgenerated("('SR-'::text || upper(replace((gen_random_uuid())::text, '-'::text, ''::text)))"))
+  holdId           String   @unique @map("hold_id") @db.Uuid
+  screeningId      String   @map("screening_id") @db.Uuid
+  customerId       String   @map("customer_id") @db.Uuid
+  paymentAttemptId String   @unique @map("payment_attempt_id") @db.Uuid
+  amountPaise      Int      @map("amount_paise")
+  confirmedAt      DateTime @default(now()) @map("confirmed_at") @db.Timestamptz(6)
+  hold             Hold @relation(fields: [holdId, screeningId, customerId], references: [id, screeningId, customerId], onUpdate: Restrict)
+  screening        Screening @relation(fields: [screeningId], references: [id], onUpdate: Restrict)
+  customer         Identity @relation(fields: [customerId], references: [id], onUpdate: Restrict)
+  paymentAttempt   PaymentAttempt @relation(fields: [paymentAttemptId, holdId], references: [id, holdId], onUpdate: Restrict)
+  seats            BookedSeat[]
+  domainEvents     DomainEvent[]
+
+  @@unique([id, screeningId])
+  @@unique([holdId, screeningId, customerId])
+  @@unique([paymentAttemptId, holdId])
+  @@map("bookings")
+}
+
+model BookedSeat {
+  id          String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId   String @map("booking_id") @db.Uuid
+  screeningId String @map("screening_id") @db.Uuid
+  seatId      String @map("seat_id") @db.Uuid
+  ticketCode  String @unique @default(dbgenerated("(gen_random_uuid())::text")) @map("ticket_code")
+  pricePaise  Int @map("price_paise")
+  booking     Booking @relation(fields: [bookingId, screeningId], references: [id, screeningId], onUpdate: Restrict)
+  seat        Seat @relation(fields: [seatId, screeningId], references: [id, screeningId], onUpdate: Restrict)
+
+  @@unique([screeningId, seatId])
+  @@map("booked_seats")
+}
+
+model PaymentAttempt {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  holdId      String   @map("hold_id") @db.Uuid
+  status      String   @default("initiated")
+  amountPaise Int      @map("amount_paise")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  finalizedAt DateTime? @map("finalized_at") @db.Timestamptz(6)
+  hold        Hold @relation(fields: [holdId], references: [id], onUpdate: Restrict)
+  booking     Booking?
+  events      PaymentEvent[]
+  refundRequired RefundRequired?
+
+  @@unique([id, holdId])
+  @@index([holdId])
+  @@map("payment_attempts")
+}
+
+model PaymentEvent {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  providerEventId  String   @unique @map("provider_event_id")
+  paymentAttemptId String   @map("payment_attempt_id") @db.Uuid
+  outcome          String
+  payload          Json
+  disposition      String   @default("pending")
+  receivedAt       DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
+  processedAt      DateTime? @map("processed_at") @db.Timestamptz(6)
+  paymentAttempt   PaymentAttempt @relation(fields: [paymentAttemptId], references: [id], onUpdate: Restrict)
+
+  @@index([paymentAttemptId, receivedAt])
+  @@map("payment_events")
+}
+
+model RefundRequired {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  paymentAttemptId String   @unique @map("payment_attempt_id") @db.Uuid
+  amountPaise      Int      @map("amount_paise")
+  reason           String
+  status           String   @default("required")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  refundedAt       DateTime? @map("refunded_at") @db.Timestamptz(6)
+  paymentAttempt   PaymentAttempt @relation(fields: [paymentAttemptId], references: [id], onUpdate: Restrict)
+
+  @@map("refund_required")
+}
+
+model IdempotencyRecord {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerId   String   @map("customer_id") @db.Uuid
+  screeningId  String   @map("screening_id") @db.Uuid
+  operation    String
+  key          String
+  requestHash  String   @map("request_hash")
+  status       String   @default("in_progress")
+  responseCode Int?     @map("response_code")
+  responseBody Json?    @map("response_body")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  lockedUntil  DateTime @default(dbgenerated("(now() + '00:00:30'::interval)")) @map("locked_until") @db.Timestamptz(6)
+  retainUntil  DateTime @default(dbgenerated("(now() + '24:00:00'::interval)")) @map("retain_until") @db.Timestamptz(6)
+  customer     Identity @relation(fields: [customerId], references: [id], onUpdate: Restrict)
+  screening    Screening @relation(fields: [screeningId], references: [id], onUpdate: Restrict)
+
+  @@unique([customerId, operation, key])
+  @@index([retainUntil])
+  @@index([screeningId])
+  @@map("idempotency_records")
+}
+
+model SimulationRun {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  screeningId String   @map("screening_id") @db.Uuid
+  operatorId  String   @map("operator_id") @db.Uuid
+  status      String   @default("pending")
+  config      Json
+  results     Json?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  startedAt   DateTime? @map("started_at") @db.Timestamptz(6)
+  finishedAt  DateTime? @map("finished_at") @db.Timestamptz(6)
+  screening   Screening @relation(fields: [screeningId], references: [id], onUpdate: Restrict)
+  operator    Identity @relation(fields: [operatorId], references: [id], onUpdate: Restrict)
+
+  @@map("simulation_runs")
+}
+
+model DomainEvent {
+  id          BigInt   @id @default(autoincrement())
+  screeningId String   @map("screening_id") @db.Uuid
+  bookingId   String?  @map("booking_id") @db.Uuid
+  kind        String
+  payload     Json
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(6)
+  screening   Screening @relation(fields: [screeningId], references: [id], onUpdate: Restrict)
+  booking     Booking? @relation(fields: [bookingId, screeningId], references: [id, screeningId], onUpdate: Restrict)
+
+  @@unique([bookingId, kind])
+  @@index([publishedAt, id])
+  @@map("domain_events")
+}

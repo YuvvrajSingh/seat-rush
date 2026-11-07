@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch --conditions=development src/index.ts",
+    "dev": "tsx watch --conditions=development --env-file-if-exists=../../.env src/index.ts",
     "build": "tsc -p tsconfig.build.json",
-    "start": "node dist/index.js",
+    "start": "node --env-file-if-exists=../../.env dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -17,6 +17,7 @@
     "bullmq": "^6.7.2",
     "cors": "^2.8.6",
     "express": "^5.3.0",
+    "ioredis": "^5.11.1",
     "pino": "^10.4.0",
     "pino-http": "^11.0.0",
     "zod": "^4.6.7"

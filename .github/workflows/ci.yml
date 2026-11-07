@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch or PR supersedes the running check.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: seatrush
+          POSTGRES_PASSWORD: seatrush
+          POSTGRES_DB: seatrush
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U seatrush -d seatrush"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+      redis:
+        image: redis:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      DATABASE_URL: postgresql://seatrush:seatrush@localhost:5433/seatrush
+      TEST_DATABASE_URL: postgresql://seatrush:seatrush@localhost:5433/seatrush_test
+      REDIS_URL: redis://localhost:6379
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Generate a per-run auth token secret
+        run: |
+          secret="$(openssl rand -hex 32)"
+          echo "::add-mask::$secret"
+          echo "AUTH_TOKEN_SECRET=$secret" >> "$GITHUB_ENV"
+
+      # No version input: pnpm/action-setup reads packageManager from package.json.
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create test database
+        run: >-
+          docker exec "${{ job.services.postgres.id }}"
+          psql -U seatrush -d seatrush -v ON_ERROR_STOP=1
+          -c "CREATE DATABASE seatrush_test OWNER seatrush;"
+
+      - name: Migrate development database
+        run: pnpm --filter @seatrush/db migrate:deploy
+
+      - name: Migrate test database
+        run: pnpm --filter @seatrush/db migrate:deploy
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
