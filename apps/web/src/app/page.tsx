@@ -8,15 +8,12 @@ import {
   SEATS_PER_ROW,
   TOTAL_SEATS,
 } from "@seatrush/shared";
+import Link from "next/link";
 import { Suspense } from "react";
+import { primaryAction } from "../components/actions.js";
 import { ApiStatus, ApiStatusPending } from "../components/api-status.js";
 import { HallPreview } from "../components/hall-preview.js";
-
-const rupees = new Intl.NumberFormat("en-IN", {
-  style: "currency",
-  currency: "INR",
-  maximumFractionDigits: 0,
-});
+import { formatPaise } from "../lib/money.js";
 
 const HOUSE_RULES: ReadonlyArray<{ term: string; detail: string }> = [
   {
@@ -27,7 +24,7 @@ const HOUSE_RULES: ReadonlyArray<{ term: string; detail: string }> = [
     term: "Time to pay",
     detail: `${HOLD_TTL_SECONDS / 60} minutes, timed by the database clock`,
   },
-  { term: "Price", detail: `${rupees.format(SEAT_PRICE_PAISE / 100)} a seat` },
+  { term: "Price", detail: `${formatPaise(SEAT_PRICE_PAISE)} a seat` },
   {
     term: "The show",
     detail: `One ${SCREENING_DURATION_MINUTES / 60}-hour screening, ${SEAT_ROWS.length} rows of ${SEATS_PER_ROW}`,
@@ -57,6 +54,9 @@ export default function HomePage() {
             moment, holds expire, payments fail and retry, and a live dashboard shows each outcome as it
             happens. Through all of it, no seat ever has two owners.
           </p>
+          <Link href="/book" className={`${primaryAction} mt-7`}>
+            Book seats
+          </Link>
         </div>
 
         <div className="min-w-0 lg:col-start-2 lg:row-span-2 lg:row-start-1 lg:self-center">

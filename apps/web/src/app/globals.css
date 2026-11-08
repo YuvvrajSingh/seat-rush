@@ -182,6 +182,55 @@
   );
 }
 
+/* Chosen but not yet held: a heavier outline in the hold colour, never a fill (prd §6). */
+.seat-selected {
+  border-width: 3px;
+  border-color: var(--seat-mine);
+  color: var(--seat-mine);
+}
+
+/* Refused by the box office because another customer owns it now: a dashed ring. */
+.seat-taken {
+  outline: 2px dashed var(--hall-ink);
+  outline-offset: 2px;
+}
+
+/* Interactive seats on the booking page. */
+.seat-button {
+  touch-action: manipulation;
+  transition-property: background-color, border-color, color;
+  transition-duration: 150ms;
+  transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.seat-button[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+@media (hover: hover) {
+  .seat-button:not([aria-disabled="true"]):hover {
+    background-color: color-mix(in oklab, var(--seat-mine) 16%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .seat-button {
+    transition-property: background-color, border-color, color, transform;
+  }
+
+  .seat-button:not([aria-disabled="true"]):active {
+    transform: scale(0.97);
+  }
+}
+
+/* The page accent is crimson in the light scheme, too dark on the hall; the hall uses screen light. */
+.seat-button:focus-visible {
+  outline: 2px solid var(--screen-light);
+  outline-offset: 2px;
+  position: relative;
+  z-index: 1;
+}
+
 /* House lights dim: seats appear row by row from the screen back. The only page-load motion. */
 @keyframes seat-in {
   from {

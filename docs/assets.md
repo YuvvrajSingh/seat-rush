@@ -48,7 +48,7 @@ Avoid: red velvet, gold trim, haze or light beams, lens flare, popcorn, drinks, 
 
 ## social-cover
 
-- **File:** `apps/web/public/images/social-cover.webp` (1200×628 crop, generated 2026-11-07), the photographic layer; the title is composited in code for the Open Graph image.
+- **File:** `apps/web/assets/social-cover.jpg` (1200×630, generated 2026-11-07), a build-time input only: `app/opengraph-image.tsx` composites the title over it with a bundled TTF font. Not served from `public/`.
 - **Used on:** Open Graph / social preview until Week 4, when the cover can be rendered from a real recorded run instead.
 - **Prompt:**
 

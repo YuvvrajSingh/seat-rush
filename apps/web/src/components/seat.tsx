@@ -1,14 +1,5 @@
 import type { ReactNode } from "react";
-
-/** FR-01 seat states as seen by the current customer. */
-export type SeatState = "available" | "held-by-you" | "held-by-other" | "confirmed";
-
-export const SEAT_STATE_LABELS: Record<SeatState, string> = {
-  available: "Available",
-  "held-by-you": "Held by you",
-  "held-by-other": "Held by another customer",
-  confirmed: "Confirmed",
-};
+import type { SeatMark, SeatState } from "../lib/seat-map.js";
 
 const STATE_CLASSES: Record<SeatState, string> = {
   available: "border-(--seat-available) text-(--seat-available-ink)",
@@ -16,6 +7,20 @@ const STATE_CLASSES: Record<SeatState, string> = {
   "held-by-other": "seat-hatch border-(--seat-held) text-(--seat-held-ink)",
   confirmed: "border-(--seat-confirmed) bg-(--seat-confirmed) text-(--seat-confirmed-ink)",
 };
+
+/** Selection stays an outline, never a fill, so it cannot be mistaken for a hold. */
+const MARK_CLASSES: Record<SeatMark, string> = {
+  selected: "seat-selected",
+  taken: "seat-taken",
+};
+
+const SEAT_BASE =
+  "grid size-seat shrink-0 place-items-center rounded-seat border-[1.5px] font-display text-xs font-bold tabular-nums min-[360px]:text-sm sm:text-base";
+
+/** Class list for anything drawn as a seat, a static span or an interactive button. */
+export function seatClassName(state: SeatState, mark?: SeatMark): string {
+  return mark ? `${SEAT_BASE} ${STATE_CLASSES[state]} ${MARK_CLASSES[mark]}` : `${SEAT_BASE} ${STATE_CLASSES[state]}`;
+}
 
 function Glyph({ children }: { children: ReactNode }) {
   return (
@@ -54,16 +59,19 @@ const STATE_GLYPHS: Record<Exclude<SeatState, "available">, ReactNode> = {
   ),
 };
 
+/** What a seat shows inside its outline: the seat number when available, a glyph otherwise. */
+export function SeatFace({ state, number }: { state: SeatState; number?: number | undefined }) {
+  return state === "available" ? number : STATE_GLYPHS[state];
+}
+
 /**
  * A single seat, drawn with a backrest-shaped top edge. Purely presentational:
  * callers supply accessible names where the seat is meaningful on its own.
  */
-export function Seat({ state, number }: { state: SeatState; number?: number }) {
+export function Seat({ state, number, mark }: { state: SeatState; number?: number; mark?: SeatMark }) {
   return (
-    <span
-      className={`grid size-seat shrink-0 place-items-center rounded-seat border-[1.5px] font-display text-xs font-bold tabular-nums min-[360px]:text-sm sm:text-base ${STATE_CLASSES[state]}`}
-    >
-      {state === "available" ? number : STATE_GLYPHS[state]}
+    <span className={seatClassName(state, mark)}>
+      <SeatFace state={state} number={number} />
     </span>
   );
 }
