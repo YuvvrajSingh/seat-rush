@@ -1,0 +1,87 @@
+import { Router, type RequestHandler } from "express";
+import { randomUUID } from "node:crypto";
+import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
+import type { PrismaClient } from "@seatrush/db";
+import { z } from "zod";
+import { CreateHoldRequestSchema, DemoScreeningResponseSchema, DemoSessionRequestSchema, DemoSessionResponseSchema,
+  HoldParamsSchema, HoldSchema, ScreeningParamsSchema, ScreeningSnapshotSchema, ErrorResponseSchema } from "@seatrush/shared";
+import { createHold, deleteHold, getHold, getSnapshot } from "../booking.js";
+import { customerAuth, issueCustomerToken } from "../middleware/auth.js";
+import { HttpError } from "../middleware/errors.js";
+import { errorResponses } from "../openapi-responses.js";
+import { demoSessionLimit } from "../middleware/demo-session-limit.js";
+
+export interface BookingDeps { prisma: PrismaClient; authTokenSecret: string }
+function parse<T>(schema: z.ZodType<T>, input: unknown, code: "bad_request" | "invalid_seats" = "bad_request"): T {
+  const parsed = schema.safeParse(input);
+  if (!parsed.success) throw new HttpError(400, code, "Invalid request");
+  return parsed.data;
+}
+
+export function bookingRouter({ prisma, authTokenSecret }: BookingDeps): Router {
+  const router = Router();
+  const required = customerAuth(authTokenSecret, true, prisma);
+  const optional = customerAuth(authTokenSecret, false, prisma);
+  const noStore: RequestHandler = (_req, res, next) => { res.set("Cache-Control", "no-store"); next(); };
+
+  router.post("/auth/demo-session", noStore, demoSessionLimit(), async (req, res) => {
+    parse(DemoSessionRequestSchema, req.body ?? {});
+    const customer = await prisma.identity.create({ data: {
+      demoKey: `web-${randomUUID()}`, displayName: "Demo Customer", role: "customer",
+    }, select: { id: true, displayName: true } });
+    res.json(DemoSessionResponseSchema.parse({ customer, ...issueCustomerToken(authTokenSecret, customer.id) }));
+  });
+  router.get("/screenings/demo", noStore, async (_req, res) => {
+    const screening = await prisma.screening.findUnique({ where: { demoKey: "demo-screening" }, select: { id: true } });
+    if (!screening) throw new HttpError(404, "not_found", "Demo screening not found");
+    res.json(DemoScreeningResponseSchema.parse({ screeningId: screening.id }));
+  });
+  router.get("/screenings/:screeningId/snapshot", noStore, optional, async (req, res) => {
+    const { screeningId } = parse(ScreeningParamsSchema, req.params);
+    res.json(await getSnapshot(prisma, screeningId, req.customer?.id ?? null));
+  });
+  router.post("/screenings/:screeningId/holds", noStore, required, async (req, res) => {
+    const { screeningId } = parse(ScreeningParamsSchema, req.params, "invalid_seats");
+    const body = parse(CreateHoldRequestSchema, req.body, "invalid_seats");
+    res.status(201).json(await createHold(prisma, screeningId, req.customer!.id, body));
+  });
+  router.get("/holds/:holdId", noStore, required, async (req, res) => {
+    const { holdId } = parse(HoldParamsSchema, req.params);
+    res.json(await getHold(prisma, holdId, req.customer!.id));
+  });
+  router.delete("/holds/:holdId", noStore, required, async (req, res) => {
+    const { holdId } = parse(HoldParamsSchema, req.params);
+    res.json(await deleteHold(prisma, holdId, req.customer!.id));
+  });
+  return router;
+}
+
+export function registerBookingOpenApi(registry: OpenAPIRegistry): void {
+  registry.registerComponent("securitySchemes", "CustomerBearer", { type: "http", scheme: "bearer", description: "HMAC-SHA256 signed demo session; expires after one hour" });
+  const security = [{ CustomerBearer: [] }];
+  const response = (schema: z.ZodType) => ({ description: "Success", content: { "application/json": { schema } } });
+  const failures = {
+    400: "bad_request / invalid_seats / invalid_json / payload_too_large",
+    401: "unauthorized: missing, expired, forged or obsolete customer token",
+    404: "not_found: unknown screening or hold (including another customer's hold)",
+    409: "seat_unavailable / active_hold_exists / hold_not_active",
+    429: "rate_limited: maximum 10 demo-session attempts per IP per minute",
+    503: "retry_later: database unavailable or bounded retry exhausted",
+  };
+  const errors = (...statuses: (keyof typeof failures)[]) => Object.fromEntries(statuses.map((status) =>
+    [status, { description: failures[status], content: { "application/json": { schema: ErrorResponseSchema } } }]));
+  registry.registerPath({ method: "post", path: "/auth/demo-session", tags: ["auth"],
+    request: { body: { content: { "application/json": { schema: DemoSessionRequestSchema } } } },
+    responses: { 200: response(DemoSessionResponseSchema), ...errors(400, 429, 503), ...errorResponses } });
+  registry.registerPath({ method: "get", path: "/screenings/demo", tags: ["screenings"],
+    responses: { 200: response(DemoScreeningResponseSchema), ...errors(404, 503), ...errorResponses } });
+  registry.registerPath({ method: "get", path: "/screenings/{screeningId}/snapshot", tags: ["screenings"],
+    security: [{}, ...security], request: { params: ScreeningParamsSchema },
+    responses: { 200: response(ScreeningSnapshotSchema), ...errors(400, 401, 404, 503), ...errorResponses } });
+  registry.registerPath({ method: "post", path: "/screenings/{screeningId}/holds", tags: ["holds"], security,
+    request: { params: ScreeningParamsSchema, body: { required: true, content: { "application/json": { schema: CreateHoldRequestSchema } } } },
+    responses: { 201: response(HoldSchema), ...errors(400, 401, 404, 409, 503), ...errorResponses } });
+  for (const method of ["get", "delete"] as const) registry.registerPath({ method, path: "/holds/{holdId}", tags: ["holds"], security,
+    request: { params: HoldParamsSchema }, responses: { 200: response(HoldSchema), ...errors(400, 401, 404, 503),
+      ...(method === "delete" ? errors(409) : {}), ...errorResponses } });
+}

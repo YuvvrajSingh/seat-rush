@@ -3,6 +3,8 @@ import { apiEnvSchema, EnvValidationError, parseEnv, webEnvSchema, workerEnvSche
 
 const DATABASE_URL = "postgresql://seatrush:s3cret-pass@localhost:5433/seatrush";
 const REDIS_URL = "redis://localhost:6379";
+const AUTH_TOKEN_SECRET = "0123456789abcdef0123456789abcdef";
+const required = { DATABASE_URL, REDIS_URL, AUTH_TOKEN_SECRET };
 
 function parseError(run: () => unknown): EnvValidationError {
   try {
@@ -15,42 +17,50 @@ function parseError(run: () => unknown): EnvValidationError {
 }
 
 describe("parseEnv(apiEnvSchema)", () => {
-  it("applies defaults when only the required URLs are set", () => {
-    expect(parseEnv(apiEnvSchema, { DATABASE_URL, REDIS_URL })).toEqual({
+  it("applies defaults when only the required variables are set", () => {
+    expect(parseEnv(apiEnvSchema, required)).toEqual({
       NODE_ENV: "development",
       LOG_LEVEL: "info",
       REDIS_URL,
       DATABASE_URL,
       API_PORT: 4000,
       WEB_ORIGIN: "http://localhost:3000",
+      API_DB_POOL_MAX: 20,
+      AUTH_TOKEN_SECRET,
     });
   });
 
   it("treats empty strings as unset so defaults still apply", () => {
-    const env = parseEnv(apiEnvSchema, { DATABASE_URL, REDIS_URL, API_PORT: "", WEB_ORIGIN: "", LOG_LEVEL: "" });
+    const env = parseEnv(apiEnvSchema, { ...required, API_PORT: "", WEB_ORIGIN: "", LOG_LEVEL: "" });
     expect(env.API_PORT).toBe(4000);
     expect(env.WEB_ORIGIN).toBe("http://localhost:3000");
     expect(env.LOG_LEVEL).toBe("info");
   });
 
   it("coerces API_PORT from a string", () => {
-    expect(parseEnv(apiEnvSchema, { DATABASE_URL, REDIS_URL, API_PORT: "4100" }).API_PORT).toBe(4100);
+    expect(parseEnv(apiEnvSchema, { ...required, API_PORT: "4100" }).API_PORT).toBe(4100);
   });
 
   it.each(["abc", "0", "65536", "40.5"])("rejects API_PORT=%s", (API_PORT) => {
-    const error = parseError(() => parseEnv(apiEnvSchema, { DATABASE_URL, REDIS_URL, API_PORT }));
+    const error = parseError(() => parseEnv(apiEnvSchema, { ...required, API_PORT }));
     expect(error.issues).toHaveLength(1);
     expect(error.issues[0]).toMatch(/^API_PORT: /);
   });
 
   it("reports every missing required variable at once", () => {
     const error = parseError(() => parseEnv(apiEnvSchema, { DATABASE_URL: "" }));
-    expect(error.issues).toEqual(["REDIS_URL: required", "DATABASE_URL: required"]);
+    expect(error.issues).toEqual(["REDIS_URL: required", "DATABASE_URL: required", "AUTH_TOKEN_SECRET: required"]);
+  });
+
+  it("rejects a short AUTH_TOKEN_SECRET without echoing it", () => {
+    const error = parseError(() => parseEnv(apiEnvSchema, { ...required, AUTH_TOKEN_SECRET: "too-short-secret" }));
+    expect(error.issues).toEqual(["AUTH_TOKEN_SECRET: must be at least 32 characters"]);
+    expect(error.message).not.toContain("too-short-secret");
   });
 
   it("rejects URLs with the wrong scheme without echoing the value", () => {
     const error = parseError(() =>
-      parseEnv(apiEnvSchema, { DATABASE_URL: "mysql://root:s3cret-pass@db/seatrush", REDIS_URL: "http://localhost:6379" }),
+      parseEnv(apiEnvSchema, { ...required, DATABASE_URL: "mysql://root:s3cret-pass@db/seatrush", REDIS_URL: "http://localhost:6379" }),
     );
     expect(error.issues).toEqual([
       "REDIS_URL: must be a redis:// or rediss:// URL",
@@ -60,7 +70,7 @@ describe("parseEnv(apiEnvSchema)", () => {
   });
 
   it("rejects an unknown LOG_LEVEL", () => {
-    const error = parseError(() => parseEnv(apiEnvSchema, { DATABASE_URL, REDIS_URL, LOG_LEVEL: "verbose" }));
+    const error = parseError(() => parseEnv(apiEnvSchema, { ...required, LOG_LEVEL: "verbose" }));
     expect(error.issues[0]).toMatch(/^LOG_LEVEL: /);
   });
 
@@ -69,7 +79,7 @@ describe("parseEnv(apiEnvSchema)", () => {
     ["HTTP://LocalHost:3000", "http://localhost:3000"],
     ["https://seatrush.example:443/", "https://seatrush.example"],
   ])("canonicalizes WEB_ORIGIN=%s to %s", (WEB_ORIGIN, expected) => {
-    expect(parseEnv(apiEnvSchema, { DATABASE_URL, REDIS_URL, WEB_ORIGIN }).WEB_ORIGIN).toBe(expected);
+    expect(parseEnv(apiEnvSchema, { ...required, WEB_ORIGIN }).WEB_ORIGIN).toBe(expected);
   });
 
   it.each([
@@ -78,14 +88,14 @@ describe("parseEnv(apiEnvSchema)", () => {
     "http://localhost:3000/#top",
     "http://user:pass@localhost:3000",
   ])("rejects WEB_ORIGIN=%s that is not a bare origin", (WEB_ORIGIN) => {
-    const error = parseError(() => parseEnv(apiEnvSchema, { DATABASE_URL, REDIS_URL, WEB_ORIGIN }));
+    const error = parseError(() => parseEnv(apiEnvSchema, { ...required, WEB_ORIGIN }));
     expect(error.issues).toEqual([
       "WEB_ORIGIN: must be an origin (scheme://host[:port]) without credentials, path, query or fragment",
     ]);
   });
 
   it("rejects a non-http(s) WEB_ORIGIN", () => {
-    const error = parseError(() => parseEnv(apiEnvSchema, { DATABASE_URL, REDIS_URL, WEB_ORIGIN: "ftp://localhost" }));
+    const error = parseError(() => parseEnv(apiEnvSchema, { ...required, WEB_ORIGIN: "ftp://localhost" }));
     expect(error.issues).toEqual(["WEB_ORIGIN: must be an http:// or https:// URL"]);
   });
 });

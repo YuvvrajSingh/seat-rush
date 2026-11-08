@@ -34,6 +34,8 @@ function appWith(redisClient: Redis) {
     logger: pino({ level: "silent" }),
     webOrigin: "http://localhost:3000",
     readinessChecks: { postgres: postgresCheck(probePrisma), redis: redisCheck(redisClient) },
+    prisma: probePrisma,
+    authTokenSecret: "test-secret-not-used-for-health-checks",
   });
 }
 

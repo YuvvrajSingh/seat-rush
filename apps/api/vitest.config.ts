@@ -11,6 +11,7 @@ export default defineConfig({
   resolve: { conditions },
   ssr: { resolve: { conditions } },
   test: {
+    globalSetup: ["../../packages/db/tests/global-setup.ts"],
     include: ["tests/**/*.test.ts"],
   },
 });

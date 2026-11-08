@@ -1,9 +1,10 @@
 import { OpenAPIRegistry, OpenApiGeneratorV31 } from "@asteasolutions/zod-to-openapi";
 import { errorResponses } from "./openapi-responses.js";
 import { registerHealthOpenApi } from "./routes/health.js";
+import { registerBookingOpenApi } from "./routes/booking.js";
 
 /** Each route module contributes its paths here; add new modules' registrars to this list. */
-const registrars: ((registry: OpenAPIRegistry) => void)[] = [registerHealthOpenApi, registerOpenApiDocumentPath];
+const registrars: ((registry: OpenAPIRegistry) => void)[] = [registerHealthOpenApi, registerBookingOpenApi, registerOpenApiDocumentPath];
 
 function registerOpenApiDocumentPath(registry: OpenAPIRegistry): void {
   registry.registerPath({

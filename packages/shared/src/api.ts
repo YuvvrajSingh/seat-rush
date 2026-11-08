@@ -48,6 +48,8 @@ export const ERROR_CODES = [
   "invalid_seats",
   /** 503: a transient database conflict (deadlock/serialization); safe to retry. */
   "retry_later",
+  /** 429: the demo session issuance limit for this IP has been reached. */
+  "rate_limited",
   "internal_error",
 ] as const;
 export const ErrorCodeSchema = z.enum(ERROR_CODES);

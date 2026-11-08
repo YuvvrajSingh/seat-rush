@@ -3,6 +3,7 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { ErrorResponseSchema, ReadinessResponseSchema } from "@seatrush/shared";
 import { createApp, type AppDeps } from "../src/app.js";
+import { createPrismaClient } from "@seatrush/db";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const up = async () => undefined;
@@ -12,6 +13,8 @@ function app(overrides: Partial<AppDeps> = {}) {
     logger: pino({ level: "silent" }),
     webOrigin: "http://localhost:3000",
     readinessChecks: { postgres: up, redis: up },
+    prisma: createPrismaClient("postgresql://unused:unused@localhost:1/unused"),
+    authTokenSecret: "test-secret-not-used-for-health-checks",
     ...overrides,
   });
 }

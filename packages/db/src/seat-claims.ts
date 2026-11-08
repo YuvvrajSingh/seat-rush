@@ -26,7 +26,7 @@ export async function claimSeatsInTransaction(tx: SqlTransaction, request: SeatC
     SELECT h.id, h.screening_id AS "screeningId", h.customer_id AS "customerId",
       h.seat_count AS "seatCount", h.amount_paise AS "amountPaise",
       h.created_at AS "createdAt", h.expires_at AS "expiresAt",
-      (SELECT jsonb_agg(jsonb_build_object('id', s.id, 'label', s.label) ORDER BY s.label)
+      (SELECT jsonb_agg(jsonb_build_object('id', s.id, 'label', s.label) ORDER BY s.row, s.number)
         FROM seats s WHERE s.id = ANY(${request.seatIds}::uuid[])) AS seats
     FROM claim_seats(${request.screeningId}::uuid, ${request.customerId}::uuid, ${request.seatIds}::uuid[]) h
   `;

@@ -24,10 +24,8 @@ function loadEnv(): ApiEnv {
 const env = loadEnv();
 const logger = createLogger({ level: env.LOG_LEVEL });
 
-// Readiness-only clients with client-level timeouts (see readiness.ts). Request handlers get their
-// own clients when booking routes land. While Redis is unreachable the API keeps serving and
-// /readyz reports it (prd.md §12).
-// Probes are single-flight per dependency, so one pooled connection suffices.
+// Readiness probes use an isolated, single-connection pool so request saturation cannot starve them.
+const prisma = createPrismaClient(env.DATABASE_URL, { max: env.API_DB_POOL_MAX });
 const probePrisma = createPrismaClient(withProbeTimeouts(env.DATABASE_URL, READINESS_TIMEOUT_MS), {
   max: 1,
   connectionTimeoutMillis: READINESS_TIMEOUT_MS,
@@ -38,12 +36,15 @@ probeRedis.on("error", (err) => logger.warn({ err }, "redis connection error"));
 const app = createApp({
   logger,
   webOrigin: env.WEB_ORIGIN,
+  prisma,
+  authTokenSecret: env.AUTH_TOKEN_SECRET,
   readinessChecks: { postgres: postgresCheck(probePrisma), redis: redisCheck(probeRedis) },
 });
 const server = createServer(app);
 
 async function closeDependencies(): Promise<void> {
   const results = await Promise.allSettled([
+    prisma.$disconnect(),
     probePrisma.$disconnect(),
     probeRedis.status === "ready" ? probeRedis.quit() : Promise.resolve(probeRedis.disconnect()),
   ]);

@@ -37,6 +37,10 @@ export const apiEnvSchema = z.object({
   API_PORT: optionalVar(z.coerce.number().int().min(1).max(65_535).default(4000)),
   /** Browser origin allowed by CORS. */
   WEB_ORIGIN: optionalVar(httpOrigin.default("http://localhost:3000")),
+  /** Request-path Postgres pool size (the readiness probe has its own 1-connection pool). */
+  API_DB_POOL_MAX: optionalVar(z.coerce.number().int().positive().default(20)),
+  /** HMAC key for demo bearer tokens; generate with `openssl rand -hex 32`. */
+  AUTH_TOKEN_SECRET: z.string().min(32, { error: "must be at least 32 characters" }),
 });
 export type ApiEnv = z.infer<typeof apiEnvSchema>;
 

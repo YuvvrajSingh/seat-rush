@@ -8,7 +8,7 @@ FR-02 requires all-or-nothing holds of 1–4 seats and one active hold per custo
 
 Inventory has one `current_hold_id` per seat; `hold_items` retain historical membership. Ownership is live only when its hold is `active` and `expires_at > now()`. A BEFORE INSERT trigger sets both timestamps using the deciding transaction's database clock, with a five-minute window. Updates cannot extend that window or move/change hold identity, quantity or amount. Foreign keys use `ON UPDATE RESTRICT`.
 
-The transaction module calls `claim_seats`, which validates inputs, rejects an existing active customer hold, locks ownership rows, inserts the hold/items, and executes this conditional claim (the complete function is authoritative in the single initial migration):
+The transaction module calls `claim_seats`, which validates inputs, rejects an existing active customer hold, locks ownership rows, inserts the hold/items, and executes this conditional claim (the complete function and subsequent replacements live in the ordered SQL migrations):
 
 ```sql
 UPDATE seats s SET current_hold_id = h.id
@@ -24,9 +24,13 @@ The locked row count must equal the distinct requested quantity, and the returne
 
 ### Lock order
 
-All ownership writers follow **screening, optional customer identity, existing hold rows by ID, then seat rows by ID**. Normal operations take a screening `FOR KEY SHARE`; reset takes it `FOR UPDATE`. Hold/customer locks use `FOR NO KEY UPDATE`, allowing foreign-key key-share checks. Claims lock prior owners before inventory; cleanup, release and confirmation lock their hold before inventory. Never update several seats in physical/input order. Stale cleanup clears only `WHERE current_hold_id = old_hold_id`.
+All ownership writers follow **screening → optional customer identity → existing hold rows by ID → seat rows by ID → screening event cursor**. Normal operations take a screening `FOR KEY SHARE`; reset takes it `FOR UPDATE`. Hold/customer locks use `FOR NO KEY UPDATE`, allowing foreign-key key-share checks. Claims lock prior owners before inventory; cleanup, release and confirmation lock their hold before inventory. Never update several seats in physical/input order. Stale cleanup clears only `WHERE current_hold_id = old_hold_id`. Acquire no ownership locks after writing an event.
 
 Use short Read Committed transactions. Each statement after a lock wait gets the committed ownership snapshot; `now()` remains the deciding transaction's clock. Callers retry an entire failed transaction only for the classified retryable errors, never individual statements.
+
+Every domain-event insert takes its `screening_event_cursors` row `FOR UPDATE` as the last serialization lock, then allocates the authoritative sequence ID and updates the cursor in the same transaction. The database trigger applies this to HTTP, booking triggers and direct writers alike. The lock is held through commit, so a later event cannot become visible before an earlier ID for that screening. The existing sequence default may consume an unused ID before the trigger; gaps are allowed. A one-statement snapshot reads seats and the committed cursor together. Reset deletes events but preserves the cursor, so resume IDs do not move backwards. An index on `(screening_id, id)` supports ordered replay.
+
+Hold event payloads strictly match the public shared schemas. Customer attribution is a separate `customer_id` UUID column, deliberately not an ownership foreign key: historical attribution survives identity removal and cannot acquire an identity lock after the cursor. The event trigger assigns `at`/`created_at` from `clock_timestamp()` at insertion, truncated to milliseconds, not the transaction-start ownership clock. It is an insertion timestamp just before commit, not a claim that PostgreSQL exposes exact commit time.
 
 ### Constraints and durable outcomes
 
@@ -47,6 +51,8 @@ Use short Read Committed transactions. Each statement after a lock wait gets the
 | `SR410`, or `23P01` naming `holds_one_active_customer` | `active_hold_exists` |
 | `22023` / `22P02` | `invalid_input` (including unknown/foreign seat IDs) |
 | `40P01` / `40001` | `retryable` |
+| `SR404` / `SR401` | `not_found` / `unauthorized` |
+| `08xxx`, `57P01`–`57P03`, connection/pool timeout errors | `unavailable` → HTTP 503 `retry_later` |
 | Other errors | `internal` |
 
 ## Alternatives rejected

@@ -9,11 +9,15 @@ const isoDateTime = z.iso.datetime({ offset: true });
 /** Postgres bigserial event id, carried as a decimal string (exceeds JS safe integers eventually). */
 const eventId = z.string().regex(/^\d+$/);
 
+export const DemoSessionRequestSchema = z.object({}).strict().meta({ id: "DemoSessionRequest" });
+export const ScreeningParamsSchema = z.object({ screeningId: z.uuid() }).meta({ id: "ScreeningParams" });
+export const HoldParamsSchema = z.object({ holdId: z.uuid() }).meta({ id: "HoldParams" });
+
 // ── Auth (FR-08) ────────────────────────────────────────────────────────────────────────────────
 
 /**
- * POST /auth/demo-session. The server picks a seeded demo customer and returns a signed bearer
- * token for it; clients cannot choose an identity. Operator sessions arrive with the simulator.
+ * POST /auth/demo-session creates a fresh web demo customer and returns a signed bearer
+ * token for it; clients cannot choose an identity. Seeded customers are reserved for simulation.
  */
 export const DemoSessionResponseSchema = z
   .object({
@@ -39,6 +43,8 @@ export const SeatSnapshotSchema = z
     state: SeatStateSchema,
     /** True only when the authenticated viewer owns the hold on this seat. False when anonymous. */
     heldByYou: z.boolean(),
+    /** Live hold metadata for timers, irrespective of viewer ownership; null unless held. */
+    hold: z.object({ id: z.uuid(), expiresAt: isoDateTime }).nullable(),
   })
   .meta({ id: "SeatSnapshot" });
 export type SeatSnapshot = z.infer<typeof SeatSnapshotSchema>;
@@ -78,7 +84,7 @@ export const ScreeningSnapshotSchema = z
     }),
     /** The viewer's active hold on this screening, or null (always null when anonymous). */
     yourHold: HoldSchema.nullable(),
-    /** Highest domain event id reflected in this snapshot; "0" when none. SSE resumes after it. */
+    /** Committed screening event cursor, retained across reset; SSE resumes strictly after it. */
     lastEventId: eventId,
     /** Database clock at snapshot time, for client clock-skew correction. */
     serverTime: isoDateTime,
@@ -103,6 +109,7 @@ export const CreateHoldRequestSchema = z
       .max(MAX_SEATS_PER_HOLD)
       .refine((ids) => new Set(ids).size === ids.length, { message: "seatIds must be unique" }),
   })
+  .strict()
   .meta({ id: "CreateHoldRequest" });
 export type CreateHoldRequest = z.infer<typeof CreateHoldRequestSchema>;
 
@@ -114,7 +121,7 @@ export type CreateHoldRequest = z.infer<typeof CreateHoldRequestSchema>;
 const eventBase = {
   id: eventId,
   screeningId: z.uuid(),
-  /** Database clock when the change committed. */
+  /** Database clock at event insertion, immediately before the transaction commits. */
   at: isoDateTime,
 };
 const seatRefs = z.array(z.object({ id: z.uuid(), label: z.string() })).min(1);
@@ -122,9 +129,9 @@ const seatRefs = z.array(z.object({ id: z.uuid(), label: z.string() })).min(1);
 /** Public event shapes. Never carry customer identity; "held by you" is computed per subscriber. */
 export const SeatEventSchema = z
   .discriminatedUnion("kind", [
-    z.object({ ...eventBase, kind: z.literal("hold.created"), holdId: z.uuid(), seats: seatRefs, expiresAt: isoDateTime }),
-    z.object({ ...eventBase, kind: z.literal("hold.released"), holdId: z.uuid(), seats: seatRefs }),
-    z.object({ ...eventBase, kind: z.literal("hold.expired"), holdId: z.uuid(), seats: seatRefs }),
+    z.object({ ...eventBase, kind: z.literal("hold.created"), holdId: z.uuid(), seats: seatRefs, expiresAt: isoDateTime }).strict(),
+    z.object({ ...eventBase, kind: z.literal("hold.released"), holdId: z.uuid(), seats: seatRefs }).strict(),
+    z.object({ ...eventBase, kind: z.literal("hold.expired"), holdId: z.uuid(), seats: seatRefs }).strict(),
   ])
   .meta({ id: "SeatEvent" });
 export type SeatEvent = z.infer<typeof SeatEventSchema>;

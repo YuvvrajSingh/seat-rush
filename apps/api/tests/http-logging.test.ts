@@ -3,6 +3,7 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import { createLogger } from "../src/logger.js";
+import { createPrismaClient } from "@seatrush/db";
 
 // Captures the real request logs written by createApp's pino-http middleware.
 function appWithCapturedLogs() {
@@ -17,6 +18,8 @@ function appWithCapturedLogs() {
     logger: createLogger({ level: "info", destination }),
     webOrigin: "http://localhost:3000",
     readinessChecks: { postgres: async () => undefined, redis: async () => undefined },
+    prisma: createPrismaClient("postgresql://unused:unused@localhost:1/unused"),
+    authTokenSecret: "test-secret-not-used-for-health-checks",
   });
   return { app, lines };
 }

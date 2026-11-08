@@ -8,10 +8,11 @@ import { errorHandler, notFoundHandler } from "./middleware/errors.js";
 import { healthRouter } from "./routes/health.js";
 import { createOpenApiDocument } from "./openapi.js";
 import { READINESS_TIMEOUT_MS, type ReadinessChecks } from "./readiness.js";
+import { bookingRouter, type BookingDeps } from "./routes/booking.js";
 
 export const JSON_BODY_LIMIT = "16kb";
 
-export interface AppDeps {
+export interface AppDeps extends BookingDeps {
   logger: Logger;
   readinessChecks: ReadinessChecks;
   /** Browser origin allowed by CORS. */
@@ -36,6 +37,7 @@ export function createApp(deps: AppDeps): Express {
       readinessTimeoutMs: deps.readinessTimeoutMs ?? READINESS_TIMEOUT_MS,
     }),
   );
+  app.use(bookingRouter(deps));
 
   const openApiDocument = createOpenApiDocument();
   app.get("/openapi.json", (_req, res) => {

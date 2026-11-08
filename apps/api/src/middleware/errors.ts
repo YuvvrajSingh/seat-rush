@@ -1,5 +1,6 @@
 import type { ErrorRequestHandler, Request, RequestHandler, Response } from "express";
 import type { ErrorCode, ErrorResponse } from "@seatrush/shared";
+import { classifyDbError } from "@seatrush/db";
 
 /** Throw (or pass to `next`) from a route to produce a controlled error response. */
 export class HttpError extends Error {
@@ -8,14 +9,14 @@ export class HttpError extends Error {
     readonly status: number,
     readonly code: ErrorCode,
     message: string,
-    options?: ErrorOptions,
+    readonly options?: ErrorOptions & { seatIds?: string[] | undefined },
   ) {
     super(message, options);
   }
 }
 
-export function sendError(req: Request, res: Response, status: number, code: ErrorCode, message: string): void {
-  const body: ErrorResponse = { error: { code, message, requestId: String(req.id) } };
+export function sendError(req: Request, res: Response, status: number, code: ErrorCode, message: string, seatIds?: string[]): void {
+  const body: ErrorResponse = { error: { code, message, requestId: String(req.id), ...(seatIds ? { seatIds } : {}) } };
   res.status(status).json(body);
 }
 
@@ -40,6 +41,7 @@ interface HttpLikeError {
 
 function classify(err: unknown): { status: number; code: ErrorCode; message: string } | undefined {
   if (err instanceof HttpError) return { status: err.status, code: err.code, message: err.message };
+  if (classifyDbError(err) === "unavailable") return { status: 503, code: "retry_later", message: "Database temporarily unavailable; retry the request" };
   if (typeof err !== "object" || err === null) return undefined;
   const httpErr = err as HttpLikeError;
   if (typeof httpErr.type === "string") {
@@ -61,7 +63,7 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
   }
   const known = classify(err);
   if (known) {
-    sendError(req, res, known.status, known.code, known.message);
+    sendError(req, res, known.status, known.code, known.message, err instanceof HttpError ? err.options?.seatIds : undefined);
     return;
   }
   // pino-http logs `res.err` with the completed request at error level.
