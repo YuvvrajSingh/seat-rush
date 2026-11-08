@@ -3,8 +3,10 @@ import { Redis } from "ioredis";
 import { createPrismaClient } from "@seatrush/db";
 import { apiEnvSchema, EnvValidationError, parseEnv, type ApiEnv } from "@seatrush/shared";
 import { createApp } from "./app.js";
-import { createLogger } from "./logger.js";
+import { createLogger, logRedisConnectionErrors } from "./logger.js";
 import { postgresCheck, probeRedisOptions, READINESS_TIMEOUT_MS, redisCheck, withProbeTimeouts } from "./readiness.js";
+import { createExpiryQueue } from "./expiry-queue.js";
+import { createConflictChannel } from "./conflicts.js";
 
 /** In-flight requests get this long after SIGTERM/SIGINT before their sockets are destroyed. */
 const SHUTDOWN_GRACE_MS = 10_000;
@@ -31,22 +33,33 @@ const probePrisma = createPrismaClient(withProbeTimeouts(env.DATABASE_URL, READI
   connectionTimeoutMillis: READINESS_TIMEOUT_MS,
 });
 const probeRedis = new Redis(env.REDIS_URL, probeRedisOptions(READINESS_TIMEOUT_MS));
-probeRedis.on("error", (err) => logger.warn({ err }, "redis connection error"));
+logRedisConnectionErrors(probeRedis, logger, "redis connection error");
+const expiryQueue = createExpiryQueue(env.REDIS_URL, logger);
+const conflictPublisher = new Redis(env.REDIS_URL, { maxRetriesPerRequest: 1, enableOfflineQueue: false, connectTimeout: 1_000, commandTimeout: 1_000 });
+logRedisConnectionErrors(conflictPublisher, logger, "conflict publisher connection error");
+const conflicts = createConflictChannel({ prisma, publisher: conflictPublisher, logger });
 
 const app = createApp({
   logger,
   webOrigin: env.WEB_ORIGIN,
   prisma,
   authTokenSecret: env.AUTH_TOKEN_SECRET,
+  enqueueExpiry: (hold) => expiryQueue.enqueue(hold),
+  conflicts,
   readinessChecks: { postgres: postgresCheck(probePrisma), redis: redisCheck(probeRedis) },
 });
 const server = createServer(app);
 
 async function closeDependencies(): Promise<void> {
+  const drains = await Promise.allSettled([conflicts.close(), expiryQueue.close()]);
+  for (const result of drains) {
+    if (result.status === "rejected") logger.error({ err: result.reason }, "error draining background work");
+  }
   const results = await Promise.allSettled([
     prisma.$disconnect(),
     probePrisma.$disconnect(),
     probeRedis.status === "ready" ? probeRedis.quit() : Promise.resolve(probeRedis.disconnect()),
+    conflictPublisher.status === "ready" ? conflictPublisher.quit() : Promise.resolve(conflictPublisher.disconnect()),
   ]);
   for (const result of results) {
     if (result.status === "rejected") logger.error({ err: result.reason }, "error closing dependency");

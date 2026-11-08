@@ -9,7 +9,7 @@ export class HttpError extends Error {
     readonly status: number,
     readonly code: ErrorCode,
     message: string,
-    readonly options?: ErrorOptions & { seatIds?: string[] | undefined },
+    readonly options?: ErrorOptions & { seatIds?: string[] | undefined; retryAfter?: number },
   ) {
     super(message, options);
   }
@@ -63,6 +63,7 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
   }
   const known = classify(err);
   if (known) {
+    if (err instanceof HttpError && err.options?.retryAfter !== undefined) res.set("Retry-After", String(err.options.retryAfter));
     sendError(req, res, known.status, known.code, known.message, err instanceof HttpError ? err.options?.seatIds : undefined);
     return;
   }

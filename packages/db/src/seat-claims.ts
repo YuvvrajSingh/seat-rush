@@ -38,14 +38,13 @@ export function claimSeats(prisma: PrismaClient, request: SeatClaimRequest): Pro
   return prisma.$transaction((tx) => claimSeatsInTransaction(tx, request), { maxWait: 30_000, timeout: 30_000 });
 }
 
-/** The SQL function locks screening, hold, then its seats by id; callers can emit outbox rows atomically. */
-export async function cleanupExpiredHoldInTransaction(tx: SqlTransaction, holdId: string): Promise<number> {
-  const [row] = await tx.$queryRaw<{ cleared: number }[]>`SELECT cleanup_expired_hold(${holdId}::uuid) AS cleared`;
-  return row?.cleared ?? 0;
+/** Locks screening, hold, then seats by id; returns only cleared pointers in row/number order. */
+export async function cleanupExpiredHoldInTransaction(tx: SqlTransaction, holdId: string): Promise<{ id: string; label: string }[]> {
+  return tx.$queryRaw<{ id: string; label: string }[]>`SELECT id, label FROM cleanup_expired_hold(${holdId}::uuid)`;
 }
 
 export function cleanupExpiredHold(prisma: PrismaClient, holdId: string): Promise<number> {
-  return prisma.$transaction((tx) => cleanupExpiredHoldInTransaction(tx, holdId));
+  return prisma.$transaction(async (tx) => (await cleanupExpiredHoldInTransaction(tx, holdId)).length);
 }
 
 export async function releaseHoldInTransaction(tx: SqlTransaction, holdId: string, customerId: string): Promise<number> {

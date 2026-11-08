@@ -145,10 +145,10 @@ describe("errors", () => {
 });
 
 describe("CORS", () => {
-  it("allows the web origin and exposes x-request-id", async () => {
+  it("allows the web origin and exposes correlation and retry headers", async () => {
     const res = await request(app()).get("/healthz").set("origin", "http://localhost:3000");
     expect(res.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
-    expect(res.headers["access-control-expose-headers"]).toBe("x-request-id");
+    expect(res.headers["access-control-expose-headers"]).toBe("x-request-id,Retry-After");
   });
 
   it("answers preflight for the web origin", async () => {

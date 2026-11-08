@@ -107,6 +107,21 @@ describe("Postgres seat ownership", () => {
     expect((await prisma.seat.findUniqueOrThrow({ where: { id: seats.A1! } })).currentHoldId).toBe(current.id);
   });
 
+  it("returns only cleared expiry seats in row and numeric seat order", async () => {
+    const old = await claim(0, ["B1", "A10", "A2", "A1"]);
+    expect(await prisma.$transaction((tx) => cleanupExpiredHoldInTransaction(tx, old.id))).toEqual([]);
+    await expire(old.id);
+    const current = await claim(1, ["A1"]);
+    expect(await prisma.$transaction((tx) => cleanupExpiredHoldInTransaction(tx, old.id))).toEqual([
+      { id: seats.A2, label: "A2" },
+      { id: seats.A10, label: "A10" },
+      { id: seats.B1, label: "B1" },
+    ]);
+    expect(await prisma.$transaction((tx) => cleanupExpiredHoldInTransaction(tx, old.id))).toEqual([]);
+    expect((await prisma.seat.findUniqueOrThrow({ where: { id: seats.A1! } })).currentHoldId).toBe(current.id);
+    expect((await prisma.hold.findUniqueOrThrow({ where: { id: old.id } })).status).toBe("expired");
+  });
+
   it("rejects a second active customer/screening hold at the exclusion constraint", async () => {
     await claim(0, ["A1"]);
     await expect(claim(0, ["B1"])).rejects.toThrow(/customer already has an active hold/);
@@ -287,7 +302,7 @@ describe("ownership regression coverage", () => {
     const next = await claim(0, ["A1"]);
     await expire(next.id);
     await prisma.$transaction(async (tx) => {
-      expect(await cleanupExpiredHoldInTransaction(tx, next.id)).toBe(1);
+      expect(await cleanupExpiredHoldInTransaction(tx, next.id)).toEqual([{ id: seats.A1, label: "A1" }]);
       await tx.domainEvent.create({ data: { screeningId, kind: "hold.expired", payload: { holdId: next.id } } });
     });
     expect(await prisma.domainEvent.count()).toBe(2);

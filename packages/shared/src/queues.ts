@@ -15,3 +15,8 @@ export const QUEUE_NAMES = {
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 
 export const ALL_QUEUE_NAMES: readonly QueueName[] = Object.values(QUEUE_NAMES);
+
+/** Pub/sub only distributes already-persisted observations; it never decides ownership. */
+export const PUBSUB_CHANNELS = {
+  conflicts: "seatrush:conflicts",
+} as const;

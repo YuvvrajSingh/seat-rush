@@ -1,6 +1,7 @@
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { createLogger } from "../src/logger.js";
+import { Redis } from "ioredis";
+import { createLogger, logRedisConnectionErrors } from "../src/logger.js";
 
 function capture() {
   const lines: Record<string, unknown>[] = [];
@@ -14,6 +15,21 @@ function capture() {
 }
 
 describe("createLogger redaction", () => {
+  it("logs Redis connection errors once per outage and rearms after readiness", () => {
+    const { lines, logger } = capture();
+    const redis = new Redis({ lazyConnect: true });
+    logRedisConnectionErrors(redis, logger, "redis unavailable");
+    try {
+      redis.emit("error", new Error("first connection failure"));
+      redis.emit("error", new Error("retry connection failure"));
+      expect(lines).toHaveLength(1);
+      redis.emit("ready");
+      redis.emit("error", new Error("new outage"));
+      expect(lines).toHaveLength(2);
+      expect(lines.every((line) => line.msg === "redis unavailable")).toBe(true);
+    } finally { redis.disconnect(); }
+  });
+
   it("redacts auth headers and cookies on serialized requests", () => {
     const { lines, logger } = capture();
     logger.info({

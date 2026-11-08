@@ -52,6 +52,7 @@ model Seat {
   currentHold   Hold? @relation("CurrentHold", fields: [currentHoldId, screeningId], references: [id, screeningId], onUpdate: Restrict)
   holdItems     HoldItem[]
   bookedSeats   BookedSeat[]
+  conflictWindows ConflictWindow[]
 
   @@unique([screeningId, label])
   @@unique([screeningId, row, number])
@@ -180,7 +181,7 @@ model RefundRequired {
 model IdempotencyRecord {
   id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   customerId   String   @map("customer_id") @db.Uuid
-  screeningId  String   @map("screening_id") @db.Uuid
+  screeningId  String?  @map("screening_id") @db.Uuid
   operation    String
   key          String
   requestHash  String   @map("request_hash")
@@ -191,7 +192,7 @@ model IdempotencyRecord {
   lockedUntil  DateTime @default(dbgenerated("(now() + '00:00:30'::interval)")) @map("locked_until") @db.Timestamptz(6)
   retainUntil  DateTime @default(dbgenerated("(now() + '24:00:00'::interval)")) @map("retain_until") @db.Timestamptz(6)
   customer     Identity @relation(fields: [customerId], references: [id], onUpdate: Restrict)
-  screening    Screening @relation(fields: [screeningId], references: [id], onUpdate: Restrict)
+  screening    Screening? @relation(fields: [screeningId], references: [id], onDelete: Restrict, onUpdate: Restrict)
 
   @@unique([customerId, operation, key])
   @@index([retainUntil])
@@ -239,4 +240,18 @@ model ScreeningEventCursor {
   screening Screening @relation(fields: [screeningId], references: [id], onDelete: Cascade, onUpdate: Restrict)
 
   @@map("screening_event_cursors")
+}
+
+model ConflictWindow {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  screeningId     String   @map("screening_id") @db.Uuid
+  seatId          String   @map("seat_id") @db.Uuid
+  count           Int
+  windowStartedAt DateTime @map("window_started_at") @db.Timestamptz(6)
+  windowEndedAt   DateTime @map("window_ended_at") @db.Timestamptz(6)
+  createdAt       DateTime @default(dbgenerated("date_trunc('milliseconds'::text, clock_timestamp())")) @map("created_at") @db.Timestamptz(6)
+  seat            Seat     @relation(fields: [seatId, screeningId], references: [id, screeningId], onUpdate: Restrict)
+
+  @@index([screeningId, windowStartedAt])
+  @@map("conflict_windows")
 }

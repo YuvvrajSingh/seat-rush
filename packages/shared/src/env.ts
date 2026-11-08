@@ -44,12 +44,17 @@ export const apiEnvSchema = z.object({
 });
 export type ApiEnv = z.infer<typeof apiEnvSchema>;
 
-export const workerEnvSchema = z.object(baseServerEnv);
+export const workerEnvSchema = z.object({
+  ...baseServerEnv,
+  DATABASE_URL: optionalVar(postgresUrl),
+});
 export type WorkerEnv = z.infer<typeof workerEnvSchema>;
 
 /** Browser-visible config for the web app. Next.js inlines only literal `process.env.NEXT_PUBLIC_*` reads, so pass them explicitly. */
 export const webEnvSchema = z.object({
   NEXT_PUBLIC_API_URL: optionalVar(z.url({ protocol: /^https?$/, error: "must be an http:// or https:// URL" })),
+  /** Public origin for absolute Open Graph URLs. */
+  NEXT_PUBLIC_SITE_URL: optionalVar(httpOrigin.default("http://localhost:3000")),
 });
 export type WebEnv = z.infer<typeof webEnvSchema>;
 

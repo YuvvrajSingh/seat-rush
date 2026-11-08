@@ -28,7 +28,7 @@ export function createApp(deps: AppDeps): Express {
 
   app.use(requestId());
   app.use(httpLogger(deps.logger));
-  app.use(cors({ origin: deps.webOrigin, exposedHeaders: [REQUEST_ID_HEADER] }));
+  app.use(cors({ origin: deps.webOrigin, exposedHeaders: [REQUEST_ID_HEADER, "Retry-After"] }));
   app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
   app.use(

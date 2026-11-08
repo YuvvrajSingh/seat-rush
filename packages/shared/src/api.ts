@@ -44,6 +44,10 @@ export const ERROR_CODES = [
   "active_hold_exists",
   /** 409: the hold is not active (expired, released or confirmed). */
   "hold_not_active",
+  /** 409: the scoped key was used with different parameters or body (FR-06). */
+  "idempotency_key_reused",
+  /** 409: another execution owns the scoped key; retry the same action later (FR-06). */
+  "idempotency_in_progress",
   /** 400: a seat id does not belong to this screening. */
   "invalid_seats",
   /** 503: a transient database conflict (deadlock/serialization); safe to retry. */

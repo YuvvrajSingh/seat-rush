@@ -101,12 +101,20 @@ describe("parseEnv(apiEnvSchema)", () => {
 });
 
 describe("parseEnv(workerEnvSchema)", () => {
-  it("needs only REDIS_URL", () => {
-    expect(parseEnv(workerEnvSchema, { REDIS_URL: "rediss://cache.example:6380" })).toEqual({
+  it("requires Postgres and Redis for transactional expiry processing", () => {
+    expect(parseEnv(workerEnvSchema, { DATABASE_URL, REDIS_URL: "rediss://cache.example:6380" })).toEqual({
       NODE_ENV: "development",
       LOG_LEVEL: "info",
       REDIS_URL: "rediss://cache.example:6380",
+      DATABASE_URL,
     });
+  });
+
+  it("reports the required database without echoing credentials", () => {
+    expect(parseError(() => parseEnv(workerEnvSchema, { REDIS_URL })).issues).toEqual(["DATABASE_URL: required"]);
+    const error = parseError(() => parseEnv(workerEnvSchema, { REDIS_URL, DATABASE_URL: "mysql://secret@db/worker" }));
+    expect(error.issues).toEqual(["DATABASE_URL: must be a postgres:// or postgresql:// URL"]);
+    expect(error.message).not.toContain("secret");
   });
 });
 
@@ -114,10 +122,20 @@ describe("parseEnv(webEnvSchema)", () => {
   it("accepts an http(s) API URL and rejects missing or other schemes", () => {
     expect(parseEnv(webEnvSchema, { NEXT_PUBLIC_API_URL: "http://localhost:4000" })).toEqual({
       NEXT_PUBLIC_API_URL: "http://localhost:4000",
+      NEXT_PUBLIC_SITE_URL: "http://localhost:3000",
     });
     expect(parseError(() => parseEnv(webEnvSchema, {})).issues).toEqual(["NEXT_PUBLIC_API_URL: required"]);
     expect(parseError(() => parseEnv(webEnvSchema, { NEXT_PUBLIC_API_URL: "ftp://x" })).issues).toEqual([
       "NEXT_PUBLIC_API_URL: must be an http:// or https:// URL",
     ]);
+  });
+
+  it("canonicalizes the public site origin and rejects URLs with a path", () => {
+    expect(parseEnv(webEnvSchema, {
+      NEXT_PUBLIC_API_URL: "http://localhost:4000", NEXT_PUBLIC_SITE_URL: "https://seat.example/",
+    }).NEXT_PUBLIC_SITE_URL).toBe("https://seat.example");
+    expect(parseError(() => parseEnv(webEnvSchema, {
+      NEXT_PUBLIC_API_URL: "http://localhost:4000", NEXT_PUBLIC_SITE_URL: "https://seat.example/seats",
+    })).issues).toEqual(["NEXT_PUBLIC_SITE_URL: must be an origin (scheme://host[:port]) without credentials, path, query or fragment"]);
   });
 });

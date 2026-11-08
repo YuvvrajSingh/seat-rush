@@ -10,3 +10,4 @@ export type { SeatClaim, SeatClaimRequest, SqlTransaction } from "./seat-claims.
 export { classifyDbError } from "./errors.js";
 export type { DbErrorKind } from "./errors.js";
 export { takeOverStaleIdempotency } from "./idempotency.js";
+export { emitHoldEvent } from "./hold-events.js";

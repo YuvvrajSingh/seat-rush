@@ -136,3 +136,26 @@ export const SeatEventSchema = z
   .meta({ id: "SeatEvent" });
 export type SeatEvent = z.infer<typeof SeatEventSchema>;
 export type SeatEventKind = SeatEvent["kind"];
+
+// ── Conflict windows (§9; independent of the ownership-event cursor) ────────────────────────────
+
+/** One seat's exact rejected-request count. No customer identity or inferred requested seats. */
+export const ConflictWindowSchema = z
+  .object({
+    id: z.uuid(),
+    kind: z.literal("seat.conflict"),
+    screeningId: z.uuid(),
+    seatId: z.uuid(),
+    count: z.number().int().positive().max(2_147_483_647),
+    /** API aggregation interval; explicit flush/shutdown may close a window early. */
+    windowStartedAt: isoDateTime,
+    windowEndedAt: isoDateTime,
+    /** Database insertion clock, not an ownership change or an SSE resume cursor. */
+    at: isoDateTime,
+  })
+  .strict()
+  .refine((window) => Date.parse(window.windowEndedAt) >= Date.parse(window.windowStartedAt), {
+    path: ["windowEndedAt"], message: "windowEndedAt must not precede windowStartedAt",
+  })
+  .meta({ id: "ConflictWindow" });
+export type ConflictWindow = z.infer<typeof ConflictWindowSchema>;

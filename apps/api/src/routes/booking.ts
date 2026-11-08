@@ -5,20 +5,28 @@ import type { PrismaClient } from "@seatrush/db";
 import { z } from "zod";
 import { CreateHoldRequestSchema, DemoScreeningResponseSchema, DemoSessionRequestSchema, DemoSessionResponseSchema,
   HoldParamsSchema, HoldSchema, ScreeningParamsSchema, ScreeningSnapshotSchema, ErrorResponseSchema } from "@seatrush/shared";
-import { createHold, deleteHold, getHold, getSnapshot } from "../booking.js";
+import { createHoldInTransaction, deleteHold, deleteHoldInTransaction, getHold, getSnapshot } from "../booking.js";
+import { idempotent } from "../idempotency.js";
 import { customerAuth, issueCustomerToken } from "../middleware/auth.js";
 import { HttpError } from "../middleware/errors.js";
 import { errorResponses } from "../openapi-responses.js";
 import { demoSessionLimit } from "../middleware/demo-session-limit.js";
 
-export interface BookingDeps { prisma: PrismaClient; authTokenSecret: string }
+export interface BookingDeps {
+  prisma: PrismaClient;
+  authTokenSecret: string;
+  enqueueExpiry?: (hold: { id: string; expiresAt: string }) => Promise<void>;
+  conflicts?: { record(screeningId: string, seatIds: readonly string[]): void };
+}
+const idempotencyKey = z.string().min(1).max(200).regex(/^[\x21-\x7e]+$/);
+const idempotencyHeaders = z.object({ "idempotency-key": idempotencyKey });
 function parse<T>(schema: z.ZodType<T>, input: unknown, code: "bad_request" | "invalid_seats" = "bad_request"): T {
   const parsed = schema.safeParse(input);
   if (!parsed.success) throw new HttpError(400, code, "Invalid request");
   return parsed.data;
 }
 
-export function bookingRouter({ prisma, authTokenSecret }: BookingDeps): Router {
+export function bookingRouter({ prisma, authTokenSecret, enqueueExpiry, conflicts }: BookingDeps): Router {
   const router = Router();
   const required = customerAuth(authTokenSecret, true, prisma);
   const optional = customerAuth(authTokenSecret, false, prisma);
@@ -42,8 +50,21 @@ export function bookingRouter({ prisma, authTokenSecret }: BookingDeps): Router 
   });
   router.post("/screenings/:screeningId/holds", noStore, required, async (req, res) => {
     const { screeningId } = parse(ScreeningParamsSchema, req.params, "invalid_seats");
-    const body = parse(CreateHoldRequestSchema, req.body, "invalid_seats");
-    res.status(201).json(await createHold(prisma, screeningId, req.customer!.id, body));
+    const key = parse(idempotencyKey, req.get("Idempotency-Key"));
+    const result = await idempotent(prisma, { customerId: req.customer!.id, screeningId,
+      operation: "hold.create", key, payload: { params: req.params, body: req.body }, requestId: String(req.id) }, async (tx, store) => {
+      const body = parse(CreateHoldRequestSchema, req.body, "invalid_seats");
+      return { status: 201, body: await createHoldInTransaction(tx, screeningId, req.customer!.id, body,
+        (hold) => store({ status: 201, body: hold })) };
+    });
+    if (!result.replayed && result.status === 201) {
+      const hold = HoldSchema.parse(result.body);
+      await enqueueExpiry?.(hold);
+    } else if (!result.replayed && result.status === 409) {
+      const error = ErrorResponseSchema.parse(result.body).error;
+      if (error.code === "seat_unavailable" && error.seatIds) conflicts?.record(screeningId, error.seatIds);
+    }
+    res.status(result.status).json(result.body);
   });
   router.get("/holds/:holdId", noStore, required, async (req, res) => {
     const { holdId } = parse(HoldParamsSchema, req.params);
@@ -51,7 +72,15 @@ export function bookingRouter({ prisma, authTokenSecret }: BookingDeps): Router 
   });
   router.delete("/holds/:holdId", noStore, required, async (req, res) => {
     const { holdId } = parse(HoldParamsSchema, req.params);
-    res.json(await deleteHold(prisma, holdId, req.customer!.id));
+    const rawKey = req.get("Idempotency-Key");
+    if (rawKey === undefined) { res.json(await deleteHold(prisma, holdId, req.customer!.id)); return; }
+    const key = parse(idempotencyKey, rawKey);
+    const owned = await prisma.hold.findFirst({ where: { id: holdId, customerId: req.customer!.id }, select: { screeningId: true } });
+    const result = await idempotent(prisma, { customerId: req.customer!.id, screeningId: owned?.screeningId ?? null,
+      operation: "hold.release", key, payload: { params: req.params, body: req.body ?? null }, requestId: String(req.id) },
+    async (tx, store) => ({ status: 200, body: await deleteHoldInTransaction(tx, holdId, req.customer!.id,
+      (hold) => store({ status: 200, body: hold })) }));
+    res.status(result.status).json(result.body);
   });
   return router;
 }
@@ -64,7 +93,7 @@ export function registerBookingOpenApi(registry: OpenAPIRegistry): void {
     400: "bad_request / invalid_seats / invalid_json / payload_too_large",
     401: "unauthorized: missing, expired, forged or obsolete customer token",
     404: "not_found: unknown screening or hold (including another customer's hold)",
-    409: "seat_unavailable / active_hold_exists / hold_not_active",
+    409: "seat_unavailable / active_hold_exists / hold_not_active / idempotency_key_reused / idempotency_in_progress (Retry-After gives remaining lease seconds)",
     429: "rate_limited: maximum 10 demo-session attempts per IP per minute",
     503: "retry_later: database unavailable or bounded retry exhausted",
   };
@@ -79,9 +108,9 @@ export function registerBookingOpenApi(registry: OpenAPIRegistry): void {
     security: [{}, ...security], request: { params: ScreeningParamsSchema },
     responses: { 200: response(ScreeningSnapshotSchema), ...errors(400, 401, 404, 503), ...errorResponses } });
   registry.registerPath({ method: "post", path: "/screenings/{screeningId}/holds", tags: ["holds"], security,
-    request: { params: ScreeningParamsSchema, body: { required: true, content: { "application/json": { schema: CreateHoldRequestSchema } } } },
+    request: { headers: idempotencyHeaders, params: ScreeningParamsSchema, body: { required: true, content: { "application/json": { schema: CreateHoldRequestSchema } } } },
     responses: { 201: response(HoldSchema), ...errors(400, 401, 404, 409, 503), ...errorResponses } });
   for (const method of ["get", "delete"] as const) registry.registerPath({ method, path: "/holds/{holdId}", tags: ["holds"], security,
-    request: { params: HoldParamsSchema }, responses: { 200: response(HoldSchema), ...errors(400, 401, 404, 503),
+    request: { params: HoldParamsSchema, ...(method === "delete" ? { headers: idempotencyHeaders.partial() } : {}) }, responses: { 200: response(HoldSchema), ...errors(400, 401, 404, 503),
       ...(method === "delete" ? errors(409) : {}), ...errorResponses } });
 }

@@ -1,4 +1,4 @@
-import { Worker, type ConnectionOptions } from "bullmq";
+import { isNotConnectionError, Worker, type ConnectionOptions } from "bullmq";
 import type { Logger } from "pino";
 import { ALL_QUEUE_NAMES } from "@seatrush/shared";
 import type { ProcessorRegistry } from "./processors.js";
@@ -22,7 +22,16 @@ export function startWorkers({ processors, connection, logger, prefix }: StartWo
     worker.on("failed", (job, err) =>
       log.error({ err, jobId: job?.id, attemptsMade: job?.attemptsMade }, "job failed"),
     );
-    worker.on("error", (err) => log.error({ err }, "worker error"));
+    let connectionFailed = false;
+    function onError(err: Error): void {
+      const connectionError = !isNotConnectionError(err);
+      if (connectionError && connectionFailed) return;
+      if (connectionError) connectionFailed = true;
+      log.error({ err }, "worker error");
+    }
+    worker.on("error", onError);
+    // The backend forwards ready again after Redis reconnects.
+    worker.getBackend().on("ready", () => { connectionFailed = false; });
     workers.push(worker);
   }
   return workers;

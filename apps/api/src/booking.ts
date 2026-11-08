@@ -1,5 +1,5 @@
-import { claimSeatsInTransaction, classifyDbError, releaseHoldInTransaction, type PrismaClient, type SqlTransaction } from "@seatrush/db";
-import { HoldSchema, ScreeningSnapshotSchema, SeatEventSchema, type CreateHoldRequest, type Hold } from "@seatrush/shared";
+import { claimSeatsInTransaction, classifyDbError, emitHoldEvent, releaseHoldInTransaction, type PrismaClient, type SqlTransaction } from "@seatrush/db";
+import { HoldSchema, ScreeningSnapshotSchema, type CreateHoldRequest, type Hold } from "@seatrush/shared";
 import { HttpError } from "./middleware/errors.js";
 
 function canonicalHold(hold: Hold): Hold {
@@ -57,17 +57,6 @@ export async function getSnapshot(db: PrismaClient, screeningId: string, custome
   return snapshot;
 }
 
-async function emitHoldEvent(tx: SqlTransaction, kind: "hold.created" | "hold.released", hold: Hold, customerId: string) {
-  const payload = JSON.stringify({ kind, screeningId: hold.screeningId, holdId: hold.id, seats: hold.seats,
-    ...(kind === "hold.created" ? { expiresAt: hold.expiresAt } : {}) });
-  // BEFORE INSERT locks the screening cursor last, assigns the id and insertion clock, and
-  // holds that lock until commit. No ownership locks may be acquired after this write.
-  const [event] = await tx.$queryRaw<{ payload: unknown }[]>`
-    INSERT INTO domain_events (screening_id, customer_id, kind, payload)
-    VALUES (${hold.screeningId}::uuid, ${customerId}::uuid, ${kind}, ${payload}::jsonb)
-    RETURNING payload`;
-  SeatEventSchema.parse(event?.payload);
-}
 
 /** SQL embeds the exact locked conflict set; never infer it from a later, racy read. */
 function conflictingSeatIds(error: unknown): string[] | undefined {
@@ -81,7 +70,7 @@ function conflictingSeatIds(error: unknown): string[] | undefined {
   return undefined;
 }
 
-async function withDbRetry<T>(operation: () => Promise<T>): Promise<T> {
+export async function withDbRetry<T>(operation: () => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try { return await operation(); }
     catch (error) {
@@ -103,23 +92,29 @@ async function withDbRetry<T>(operation: () => Promise<T>): Promise<T> {
   }
 }
 
-export function createHold(db: PrismaClient, screeningId: string, customerId: string, request: CreateHoldRequest) {
-  return withDbRetry(() => db.$transaction(async (tx) => {
-    const claimed = await claimSeatsInTransaction(tx, { screeningId, customerId, seatIds: request.seatIds });
-    const hold = HoldSchema.parse({ ...claimed, status: "active", createdAt: claimed.createdAt.toISOString(), expiresAt: claimed.expiresAt.toISOString() });
-    await emitHoldEvent(tx, "hold.created", hold, customerId);
-    return hold;
-  }, { maxWait: 30_000, timeout: 30_000 }));
+export async function createHoldInTransaction(tx: SqlTransaction, screeningId: string, customerId: string, request: CreateHoldRequest,
+  beforeEvent?: (hold: Hold) => Promise<void>) {
+  const claimed = await claimSeatsInTransaction(tx, { screeningId, customerId, seatIds: request.seatIds });
+  const hold = HoldSchema.parse({ ...claimed, status: "active", createdAt: claimed.createdAt.toISOString(), expiresAt: claimed.expiresAt.toISOString() });
+  await beforeEvent?.(hold);
+  await emitHoldEvent(tx, "hold.created", hold, customerId);
+  return hold;
+}
+
+
+export async function deleteHoldInTransaction(tx: SqlTransaction, holdId: string, customerId: string,
+  beforeEvent?: (hold: Hold) => Promise<void>) {
+  const before = await getHold(tx, holdId, customerId);
+  if (before.status !== "active") throw new HttpError(409, "hold_not_active", "Hold is no longer active");
+  const cleared = await releaseHoldInTransaction(tx, holdId, customerId);
+  const hold = await getHold(tx, holdId, customerId);
+  if (cleared === 0 || hold.status !== "released") throw new HttpError(409, "hold_not_active", "Hold is no longer active");
+  await beforeEvent?.(hold);
+  await emitHoldEvent(tx, "hold.released", hold, customerId);
+  return hold;
 }
 
 export function deleteHold(db: PrismaClient, holdId: string, customerId: string) {
-  return withDbRetry(() => db.$transaction(async (tx) => {
-    const before = await getHold(tx, holdId, customerId);
-    if (before.status !== "active") throw new HttpError(409, "hold_not_active", "Hold is no longer active");
-    const cleared = await releaseHoldInTransaction(tx, holdId, customerId);
-    const hold = await getHold(tx, holdId, customerId);
-    if (cleared === 0 || hold.status !== "released") throw new HttpError(409, "hold_not_active", "Hold is no longer active");
-    await emitHoldEvent(tx, "hold.released", hold, customerId);
-    return hold;
-  }, { maxWait: 30_000, timeout: 30_000 }));
+  return withDbRetry(() => db.$transaction((tx) => deleteHoldInTransaction(tx, holdId, customerId),
+    { maxWait: 30_000, timeout: 30_000 }));
 }

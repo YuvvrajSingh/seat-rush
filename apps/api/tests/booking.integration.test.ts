@@ -1,17 +1,24 @@
 import { createHmac, randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { pino } from "pino";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { checkSeatInvariants, claimSeatsInTransaction, createPrismaClient } from "@seatrush/db";
+import { checkSeatInvariants, claimSeatsInTransaction, cleanupExpiredHoldInTransaction, createPrismaClient, emitHoldEvent } from "@seatrush/db";
 import { DemoSessionResponseSchema, HoldSchema, ScreeningSnapshotSchema, SeatEventSchema } from "@seatrush/shared";
 import { createApp } from "../src/app.js";
 import { seedDemo } from "../../../packages/db/src/seed.js";
+import { idempotent } from "../src/idempotency.js";
+import { createHoldInTransaction } from "../src/booking.js";
+import { Redis } from "ioredis";
+import { createConflictChannel } from "../src/conflicts.js";
 
 const url = process.env.TEST_DATABASE_URL;
 if (!url || url === process.env.DATABASE_URL) throw new Error("A separate TEST_DATABASE_URL is required");
 const prisma = createPrismaClient(url, { max: 20 });
 const secret = "integration-test-auth-secret-at-least-32-characters";
-const app = createApp({ prisma, authTokenSecret: secret, logger: pino({ level: "silent" }),
+const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379", { maxRetriesPerRequest: 1 });
+const conflicts = createConflictChannel({ prisma, publisher: redis, logger: pino({ level: "silent" }) });
+const app = createApp({ prisma, conflicts, authTokenSecret: secret, logger: pino({ level: "silent" }),
   webOrigin: "http://localhost:3000", readinessChecks: { postgres: async () => {}, redis: async () => {} } });
 let screeningId: string;
 let customers: string[];
@@ -24,7 +31,11 @@ beforeAll(async () => {
   customers = (await prisma.identity.findMany({ where: { role: "customer" }, orderBy: { demoKey: "asc" }, take: 100 })).map((c) => c.id);
   seats = Object.fromEntries((await prisma.seat.findMany({ where: { screeningId } })).map((s) => [s.label, s.id]));
 });
-beforeEach(async () => { await prisma.$executeRaw`SELECT reset_demo_screening(${screeningId}::uuid)`; });
+beforeEach(async () => {
+  await conflicts.flush();
+  await prisma.$executeRaw`DELETE FROM conflict_windows WHERE screening_id = ${screeningId}::uuid`;
+  await prisma.$executeRaw`SELECT reset_demo_screening(${screeningId}::uuid)`;
+});
 afterEach(async () => {
   // Each committed hold, including reclaims, must have exactly one seat-attributed creation event.
   const holds = await prisma.hold.findMany({ where: { screeningId }, include: { items: { include: { seat: true } } } });
@@ -39,15 +50,15 @@ afterEach(async () => {
     );
   }
 });
-afterAll(async () => { await prisma.$disconnect(); });
+afterAll(async () => { await conflicts.close(); await redis.quit(); await prisma.$disconnect(); });
 
 function token(customer = 0, expiresAt = Math.floor(Date.now() / 1000) + 3600) {
   const payload = Buffer.from(JSON.stringify({ sub: customers[customer], exp: expiresAt, role: "customer", v: 1 })).toString("base64url");
   return `${payload}.${createHmac("sha256", secret).update(payload).digest("base64url")}`;
 }
-function hold(customer: number, labels: string[]) {
+function hold(customer: number, labels: string[], key = randomUUID()) {
   return request(app).post(`/screenings/${screeningId}/holds`).auth(token(customer), { type: "bearer" })
-    .send({ seatIds: labels.map((label) => seats[label]) });
+    .set("Idempotency-Key", key).send({ seatIds: labels.map((label) => seats[label]) });
 }
 async function snapshot(customer?: number) {
   const req = request(app).get(`/screenings/${screeningId}/snapshot`);
@@ -58,6 +69,223 @@ async function snapshot(customer?: number) {
 }
 
 describe("booking HTTP boundary against Postgres", () => {
+  it("keeps deadlocks flat across mixed claims, releases, conflict persistence and cleanup", async () => {
+    const mixedDb = createPrismaClient(url!, { max: 20 });
+    const mixedConflicts = createConflictChannel({ prisma: mixedDb, publisher: redis,
+      logger: pino({ level: "silent" }), windowMs: 1, channel: `test:mixed:${randomUUID()}` });
+    const mixedApp = createApp({ prisma: mixedDb, conflicts: mixedConflicts, authTokenSecret: secret,
+      logger: pino({ level: "silent" }), webOrigin: "http://localhost:3000",
+      readinessChecks: { postgres: async () => {}, redis: async () => {} } });
+    const groups = Array.from({ length: 4 }, (_, index) => [`A${index * 2 + 1}`, `A${index * 2 + 2}`]);
+    const claim = (customer: number, labels: string[]) => request(mixedApp).post(`/screenings/${screeningId}/holds`)
+      .auth(token(customer), { type: "bearer" }).set("Idempotency-Key", randomUUID())
+      .send({ seatIds: labels.map((label) => seats[label]).toReversed() });
+    const [before] = await prisma.$queryRaw<{ deadlocks: bigint }[]>`
+      SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()`;
+    let stopFlushing = false;
+    let flusher: Promise<void> | undefined;
+    try {
+      let current = await Promise.all(groups.map(async (group, index) => {
+        const response = await claim(index, group);
+        expect(response.status).toBe(201);
+        return HoldSchema.parse(response.body);
+      }));
+      flusher = (async () => {
+        while (!stopFlushing) {
+          await mixedConflicts.flush();
+          // Exercise real concurrent PostgreSQL/Redis flushes; fake time would stall their I/O.
+          await delay(1);
+        }
+      })();
+      for (let round = 0; round < 8; round++) {
+        const rejected = await Promise.all(groups.map((group, index) => claim(40 + index, group)));
+        expect(rejected.every((response) => response.status === 409 && response.body.error.code === "seat_unavailable")).toBe(true);
+        const expired = current.filter((_, index) => index % 2 === 0);
+        await mixedDb.$executeRaw`UPDATE holds SET created_at = created_at - interval '5 minutes',
+          expires_at = expires_at - interval '5 minutes' WHERE id = ANY(${expired.map((hold) => hold.id)}::uuid[])`;
+        const previousOffset = round % 2 === 0 ? 0 : 4;
+        const nextOffset = round % 2 === 0 ? 4 : 0;
+        const next = await Promise.all(groups.map(async (group, index) => {
+          const old = current[index]!;
+          const cleanup = index % 2 === 0
+            ? mixedDb.$transaction(async (tx) => {
+              const cleared = await cleanupExpiredHoldInTransaction(tx, old.id);
+              if (cleared.length > 0) await emitHoldEvent(tx, "hold.expired", { ...old, seats: cleared }, customers[previousOffset + index]!);
+            }, { maxWait: 30_000, timeout: 30_000 })
+            : request(mixedApp).delete(`/holds/${old.id}`).auth(token(previousOffset + index), { type: "bearer" })
+              .set("Idempotency-Key", randomUUID()).then((response) => { expect(response.status).toBe(200); });
+          const [attempt] = await Promise.all([claim(nextOffset + index, group), cleanup]);
+          const acquired = attempt.status === 201 ? attempt : await claim(nextOffset + index, group);
+          expect(acquired.status).toBe(201);
+          return HoldSchema.parse(acquired.body);
+        }));
+        current = next;
+      }
+    } finally {
+      stopFlushing = true;
+      await flusher;
+      await mixedConflicts.close();
+      // Backend stats flush on disconnect; do not mistake their delayed updates for no deadlocks.
+      await mixedDb.$disconnect();
+    }
+    await prisma.$queryRaw`SELECT pg_stat_clear_snapshot()::text`;
+    const [after] = await prisma.$queryRaw<{ deadlocks: bigint }[]>`
+      SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()`;
+    expect(after!.deadlocks).toBe(before!.deadlocks);
+    expect((await checkSeatInvariants(prisma, screeningId)).ok).toBe(true);
+  }, 30_000);
+
+  it("retries one real serialization failure and commits the original logical action once", async () => {
+    let attempts = 0;
+    const result = await idempotent(prisma, { customerId: customers[0]!, screeningId, operation: "hold.create",
+      key: randomUUID(), payload: { seatIds: [seats.A1] }, requestId: randomUUID() }, async (tx, store) => {
+      if (attempts++ === 0) await tx.$executeRaw`DO $$ BEGIN RAISE EXCEPTION 'injected serialization failure' USING ERRCODE = '40001'; END $$`;
+      const body = await createHoldInTransaction(tx, screeningId, customers[0]!, { seatIds: [seats.A1!] },
+        (hold) => store({ status: 201, body: hold }));
+      return { status: 201, body };
+    });
+    expect(result.status).toBe(201);
+    expect(attempts).toBe(2);
+    expect(await prisma.hold.count({ where: { screeningId } })).toBe(1);
+    expect(await prisma.domainEvent.count({ where: { screeningId } })).toBe(1);
+  });
+
+  it("locks the screening before the execution lease while reset waits", async () => {
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const resetPid = Promise.withResolvers<number>();
+    const keyed = idempotent(prisma, { customerId: customers[0]!, screeningId, operation: "hold.create",
+      key: randomUUID(), payload: { seatIds: [seats.A1] }, requestId: randomUUID() }, async (tx, store) => {
+      entered.resolve();
+      await resume.promise;
+      return { status: 201, body: await createHoldInTransaction(tx, screeningId, customers[0]!,
+        { seatIds: [seats.A1!] }, (hold) => store({ status: 201, body: hold })) };
+    });
+    await entered.promise;
+    const reset = prisma.$transaction(async (tx) => {
+      const [backend] = await tx.$queryRaw<{ pid: number }[]>`SELECT pg_backend_pid() AS pid`;
+      resetPid.resolve(backend!.pid);
+      await tx.$executeRaw`SELECT reset_demo_screening(${screeningId}::uuid)`;
+    }, { maxWait: 10_000, timeout: 10_000 });
+    const pid = await resetPid.promise;
+    try {
+      await expect.poll(async () => {
+        const [backend] = await prisma.$queryRaw<{ wait: string | null }[]>`
+          SELECT wait_event_type AS wait FROM pg_stat_activity WHERE pid = ${pid}`;
+        return backend?.wait;
+      }).toBe("Lock");
+    } finally { resume.resolve(); }
+    expect((await keyed).status).toBe(201);
+    await reset;
+    expect(await prisma.hold.count({ where: { screeningId } })).toBe(0);
+    expect(await prisma.idempotencyRecord.count({ where: { screeningId } })).toBe(0);
+  });
+
+  it("races keyed HTTP creation with screening reset without database deadlocks", async () => {
+    const [before] = await prisma.$queryRaw<{ deadlocks: bigint }[]>`
+      SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()`;
+    for (let round = 0; round < 10; round++) {
+      const [response] = await Promise.all([
+        hold(0, ["A7"]),
+        prisma.$executeRaw`SELECT reset_demo_screening(${screeningId}::uuid)`,
+      ]);
+      expect([201, 409]).toContain(response.status);
+      if (response.status === 409) expect(["idempotency_in_progress", "active_hold_exists"]).toContain(response.body.error.code);
+    }
+    await prisma.$queryRaw`SELECT pg_sleep(1.1)::text`;
+    await prisma.$queryRaw`SELECT pg_stat_clear_snapshot()::text`;
+    const [after] = await prisma.$queryRaw<{ deadlocks: bigint }[]>`
+      SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()`;
+    expect(after!.deadlocks).toBe(before!.deadlocks);
+  }, 30_000);
+
+  it("hashes a seat set canonically and tells in-progress callers when to retry", async () => {
+    const key = randomUUID();
+    const created = await hold(0, ["A1", "A2"], key);
+    expect(created.status).toBe(201);
+    const replay = await hold(0, ["A2", "A1"], key);
+    expect(replay.status).toBe(201);
+    expect(replay.body).toEqual(created.body);
+    await prisma.$executeRaw`UPDATE idempotency_records SET status = 'in_progress', response_body = NULL,
+      response_code = NULL, locked_until = now() + interval '12 seconds' WHERE key = ${key}`;
+    const running = await hold(0, ["A1", "A2"], key);
+    expect(running.status).toBe(409);
+    expect(running.body.error.code).toBe("idempotency_in_progress");
+    expect(Number(running.headers["retry-after"])).toBeGreaterThanOrEqual(1);
+    expect(Number(running.headers["retry-after"])).toBeLessThanOrEqual(12);
+  });
+
+  it("does not retain 5xx outcomes or partially commit a hold (FR-06)", async () => {
+    const key = randomUUID();
+    const input = { customerId: customers[0]!, screeningId, operation: "hold.create", key,
+      payload: { seatIds: [seats.A1] }, requestId: randomUUID() };
+    await expect(idempotent(prisma, input, async (tx) => {
+      await createHoldInTransaction(tx, screeningId, customers[0]!, { seatIds: [seats.A1!] });
+      throw new Error("Simulated crash before result commit");
+    })).rejects.toThrow("Simulated crash");
+    expect(await prisma.idempotencyRecord.count({ where: { key } })).toBe(0);
+    expect(await prisma.hold.count({ where: { screeningId } })).toBe(0);
+    expect(await prisma.domainEvent.count({ where: { screeningId } })).toBe(0);
+    expect((await hold(0, ["A1"], key)).status).toBe(201);
+  });
+
+  it("replays a hold and rejects payload reuse without another hold or event (FR-06)", async () => {
+    const key = randomUUID();
+    const first = await hold(0, ["A1"], key);
+    const replay = await hold(0, ["A1"], key);
+    expect(first.status).toBe(201);
+    expect(replay.status).toBe(first.status);
+    expect(replay.body).toEqual(first.body);
+    expect(await prisma.hold.count({ where: { screeningId } })).toBe(1);
+    expect(await prisma.domainEvent.count({ where: { screeningId } })).toBe(1);
+    const mismatch = await hold(0, ["A2"], key);
+    expect(mismatch.status).toBe(409);
+    expect(mismatch.body.error.code).toBe("idempotency_key_reused");
+  });
+
+  it("executes twenty concurrent same-key requests exactly once (FR-06)", async () => {
+    const key = randomUUID();
+    const responses = await Promise.all(Array.from({ length: 20 }, () => hold(0, ["A7"], key)));
+    const successes = responses.filter((r) => r.status === 201);
+    expect(successes.length).toBeGreaterThan(0);
+    for (const response of responses) {
+      if (response.status === 201) expect(response.body).toEqual(successes[0]!.body);
+      else {
+        expect(response.body.error.code).toBe("idempotency_in_progress");
+        expect(Number(response.headers["retry-after"])).toBeGreaterThan(0);
+      }
+    }
+    expect(await prisma.hold.count({ where: { screeningId } })).toBe(1);
+    expect(await prisma.domainEvent.count({ where: { screeningId } })).toBe(1);
+  }, 30_000);
+
+  it("replays stored 4xx bodies and scopes keys by customer and operation", async () => {
+    await hold(0, ["A1"]);
+    const key = randomUUID();
+    const first = await hold(1, ["A1"], key);
+    const replay = await hold(1, ["A1"], key);
+    expect(first.status).toBe(409);
+    expect(replay.body).toEqual(first.body);
+    expect((await hold(2, ["A2"], key)).status).toBe(201);
+    const created = await hold(3, ["A3"], key);
+    const release = () => request(app).delete(`/holds/${created.body.id}`).auth(token(3), { type: "bearer" }).set("Idempotency-Key", key);
+    const released = await release();
+    expect(released.status).toBe(200);
+    expect((await release()).body).toEqual(released.body);
+  });
+
+  it("takes over a stale lease and requires a key on creation", async () => {
+    const key = randomUUID();
+    await hold(0, ["A1"], key);
+    await prisma.$executeRaw`UPDATE idempotency_records SET status = 'in_progress', response_body = NULL,
+      response_code = NULL, locked_until = now() - interval '1 second' WHERE key = ${key}`;
+    await prisma.$executeRaw`SELECT release_hold((SELECT id FROM holds WHERE screening_id = ${screeningId}::uuid LIMIT 1), ${customers[0]}::uuid)`;
+    const retry = await hold(0, ["A1"], key);
+    expect(retry.status).toBe(201);
+    const missing = await request(app).post(`/screenings/${screeningId}/holds`).auth(token(1), { type: "bearer" }).send({ seatIds: [seats.A2] });
+    expect(missing.status).toBe(400);
+  });
+
   it("issues a fresh web identity and a verifiable session", async () => {
     const res = await request(app).post("/auth/demo-session").send({});
     expect(res.status).toBe(200);
@@ -73,9 +301,14 @@ describe("booking HTTP boundary against Postgres", () => {
   it("allows exactly one of 100 simultaneous HTTP customers to hold A7", async () => {
     const responses = await Promise.all(Array.from({ length: 100 }, (_, customer) => hold(customer, ["A7"])));
     expect(responses.filter((res) => res.status === 201)).toHaveLength(1);
-    const conflicts = responses.filter((res) => res.status === 409);
-    expect(conflicts).toHaveLength(99);
-    for (const res of conflicts) expect(res.body.error).toMatchObject({ code: "seat_unavailable", seatIds: [seats.A7] });
+    const rejected = responses.filter((res) => res.status === 409);
+    expect(rejected).toHaveLength(99);
+    for (const res of rejected) expect(res.body.error).toMatchObject({ code: "seat_unavailable", seatIds: [seats.A7] });
+    await conflicts.flush();
+    const tallies = await prisma.$queryRaw<{ seatId: string; count: number }[]>`
+      SELECT seat_id AS "seatId", sum(count)::int AS count FROM conflict_windows
+      WHERE screening_id = ${screeningId}::uuid GROUP BY seat_id`;
+    expect(tallies).toEqual([{ seatId: seats.A7, count: 99 }]);
     const winner = HoldSchema.parse(responses.find((res) => res.status === 201)!.body);
     const events = await prisma.domainEvent.findMany({ where: { screeningId, kind: "hold.created" } });
     expect(events).toHaveLength(1);
@@ -183,7 +416,7 @@ describe("booking HTTP boundary against Postgres", () => {
 
   it("returns invalid_seats for unknown, malformed, duplicate or excessive seat identifiers", async () => {
     for (const ids of [[randomUUID()], ["not-a-uuid"], [], [seats.A1, seats.A1], ["A1", "A2", "A3", "A4", "A5"].map((s) => seats[s])]) {
-      const res = await request(app).post(`/screenings/${screeningId}/holds`).auth(token(), { type: "bearer" }).send({ seatIds: ids });
+      const res = await request(app).post(`/screenings/${screeningId}/holds`).auth(token(), { type: "bearer" }).set("Idempotency-Key", randomUUID()).send({ seatIds: ids });
       expect(res.status).toBe(400);
       expect(res.body.error.code).toBe("invalid_seats");
     }
@@ -266,7 +499,7 @@ describe("booking HTTP boundary against Postgres", () => {
   });
 
   it("returns not_found for an unknown screening", async () => {
-    const res = await request(app).post(`/screenings/${randomUUID()}/holds`).auth(token(), { type: "bearer" }).send({ seatIds: [seats.A1] });
+    const res = await request(app).post(`/screenings/${randomUUID()}/holds`).auth(token(), { type: "bearer" }).set("Idempotency-Key", randomUUID()).send({ seatIds: [seats.A1] });
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe("not_found");
   });
@@ -281,7 +514,7 @@ describe("booking HTTP boundary against Postgres", () => {
         expect(res.status).toBe(503);
         expect(res.body.error.code).toBe("retry_later");
       }
-      const holdRes = await request(unavailableApp).post(`/screenings/${screeningId}/holds`).auth(token(), { type: "bearer" }).send({ seatIds: [seats.A1] });
+      const holdRes = await request(unavailableApp).post(`/screenings/${screeningId}/holds`).auth(token(), { type: "bearer" }).set("Idempotency-Key", randomUUID()).send({ seatIds: [seats.A1] });
       expect(holdRes.status).toBe(503);
       expect(holdRes.body.error.code).toBe("retry_later");
     } finally { await unavailable.$disconnect(); }
@@ -293,7 +526,7 @@ describe("booking HTTP boundary against Postgres", () => {
     const read = await request(app).get(`/holds/${created.body.id}`).auth(token(), { type: "bearer" });
     expect(read.body).toEqual(created.body);
     expect(read.body.seats.map((s: { label: string }) => s.label)).toEqual(["A9", "A10"]);
-    const unexpected = await request(app).post(`/screenings/${screeningId}/holds`).auth(token(1), { type: "bearer" }).send({ seatIds: [seats.A1], customerId: customers[0] });
+    const unexpected = await request(app).post(`/screenings/${screeningId}/holds`).auth(token(1), { type: "bearer" }).set("Idempotency-Key", randomUUID()).send({ seatIds: [seats.A1], customerId: customers[0] });
     expect(unexpected.status).toBe(400);
   });
 
