@@ -67,6 +67,7 @@ export const HoldSchema = z
     amountPaise: z.number().int().positive(),
     createdAt: isoDateTime,
     expiresAt: isoDateTime,
+    latestPaymentAttemptId: z.uuid().nullable(),
   })
   .meta({ id: "Hold" });
 export type Hold = z.infer<typeof HoldSchema>;
@@ -151,6 +152,7 @@ export const StartPaymentRequestSchema = z
     delayMs: z.number().int().min(0).max(360_000).optional(),
   })
   .strict()
+  .refine((request) => request.delayMs === undefined || request.scenario === "delayed_success", { message: "delayMs is only allowed for delayed_success" })
   .meta({ id: "StartPaymentRequest" });
 export type StartPaymentRequest = z.infer<typeof StartPaymentRequestSchema>;
 
@@ -207,9 +209,11 @@ export type Booking = z.infer<typeof BookingSchema>;
 export const PAYMENT_SIGNATURE_HEADER = "x-seatrush-signature";
 
 /**
- * POST /payments/notifications body. `providerEventId` is unique per notification; redelivery of
- * the same notification reuses it (FR-06). 200 for accepted, duplicate or ignored notifications;
- * 401 invalid_signature; 503 retry_later (the simulator retries).
+ * POST /payments/notifications body. Redelivery reuses the unique providerEventId (FR-06).
+ * Processing is non-terminal and never transitions the attempt. Provider IDs compare paymentAttemptId
+ * and outcome only (occurredAt is informational); conflicting reuse returns 409 idempotency_key_reused.
+ * 200 accepted/duplicate/ignored; 400 invalid JSON/schema; 401 invalid_signature; 404 unknown/reset attempt;
+ * 409 conflicting provider event identity; 413 body too large; 415 unsupported media type; 503 retry_later.
  */
 export const PaymentNotificationSchema = z
   .object({
@@ -246,8 +250,8 @@ const seatRefs = z.array(z.object({ id: z.uuid(), label: z.string() })).min(1);
 export const SeatEventSchema = z
   .discriminatedUnion("kind", [
     z.object({ ...eventBase, kind: z.literal("hold.created"), holdId: z.uuid(), seats: seatRefs, expiresAt: isoDateTime }).strict(),
-    z.object({ ...eventBase, kind: z.literal("hold.released"), holdId: z.uuid(), seats: seatRefs }).strict(),
-    z.object({ ...eventBase, kind: z.literal("hold.expired"), holdId: z.uuid(), seats: seatRefs }).strict(),
+    z.object({ ...eventBase, kind: z.literal("hold.released"), holdId: z.uuid(), seats: seatRefs, expiresAt: isoDateTime }).strict(),
+    z.object({ ...eventBase, kind: z.literal("hold.expired"), holdId: z.uuid(), seats: seatRefs, expiresAt: isoDateTime }).strict(),
     z.object({ ...eventBase, kind: z.literal("payment.initiated"), holdId: z.uuid(), paymentAttemptId: z.uuid(), seats: seatRefs }).strict(),
     z.object({ ...eventBase, kind: z.literal("payment.failed"), holdId: z.uuid(), paymentAttemptId: z.uuid(), seats: seatRefs }).strict(),
     z.object({ ...eventBase, kind: z.literal("booking.confirmed"), holdId: z.uuid(), paymentAttemptId: z.uuid(), bookingId: z.uuid(), seats: seatRefs, amountPaise: z.number().int().positive() }).strict(),

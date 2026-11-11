@@ -19,6 +19,7 @@ const SENSITIVE_KEYS = [
 export const LOG_REDACT_PATHS: readonly string[] = [
   "req.headers.authorization",
   "req.headers.cookie",
+  'req.headers["x-seatrush-signature"]',
   'res.headers["set-cookie"]',
   ...SENSITIVE_KEYS.flatMap((key) => [key, `*.${key}`]),
 ];

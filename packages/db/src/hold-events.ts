@@ -15,7 +15,7 @@ export async function emitHoldEvent(
   customerId: string,
 ): Promise<SeatEvent> {
   const payload = JSON.stringify({ kind, screeningId: hold.screeningId, holdId: hold.id, seats: hold.seats,
-    ...(kind === "hold.created" ? { expiresAt: hold.expiresAt } : {}) });
+    expiresAt: hold.expiresAt });
   const [event] = await tx.$queryRaw<{ payload: unknown }[]>`
     INSERT INTO domain_events (screening_id, customer_id, kind, payload)
     VALUES (${hold.screeningId}::uuid, ${customerId}::uuid, ${kind}, ${payload}::jsonb)

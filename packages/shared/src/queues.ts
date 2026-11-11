@@ -13,20 +13,41 @@ export const QUEUE_NAMES = {
   paymentEvents: "payment-events",
   /** Idempotent simulated refunds for success-after-expiry (FR-05). */
   refunds: "refunds",
+  /** Serialized reconciliation is isolated from concurrent HTTP deliveries. */
+  paymentReconciliation: "payment-reconciliation",
 } as const;
 
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 
 export const ALL_QUEUE_NAMES: readonly QueueName[] = Object.values(QUEUE_NAMES);
 
+export const PAYMENT_JOB_NAMES = {
+  simulation: "payment.simulate",
+  refund: "refund.complete",
+  reconciliation: "payment.reconcile",
+} as const;
+
+/** Both producers use the same bounded infrastructure retry and retention policy. */
+export const PAYMENT_JOB_OPTIONS = {
+  attempts: 5,
+  backoff: { type: "exponential", delay: 1_000 },
+  removeOnComplete: true,
+  removeOnFail: 100,
+} as const;
+
 /**
  * `payment-events` job: the worker's simulated provider plays out one attempt's scenario and
  * delivers signed notifications to the API. Producer: API on payment start (jobId = paymentAttemptId,
  * so re-enqueueing collapses) and the worker's stalled-attempt sweep. Losing a job never decides an
- * outcome; the sweep re-enqueues initiated attempts that have no applied notification.
+ * outcome; the sweep re-enqueues initiated attempts lacking an applied terminal notification (processing is non-terminal).
  */
 export const PaymentSimulationJobSchema = z
-  .object({ paymentAttemptId: z.uuid(), scenario: PaymentScenarioSchema, delayMs: z.number().int().min(0).max(360_000) })
+  .object({
+    paymentAttemptId: z.uuid(),
+    scenario: PaymentScenarioSchema,
+    delayMs: z.number().int().min(0).max(360_000),
+    attemptCreatedAt: z.number().int().nonnegative().max(8_640_000_000_000_000 - 1),
+  })
   .strict();
 export type PaymentSimulationJob = z.infer<typeof PaymentSimulationJobSchema>;
 

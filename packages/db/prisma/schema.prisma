@@ -138,6 +138,8 @@ model PaymentAttempt {
   holdId      String   @map("hold_id") @db.Uuid
   status      String   @default("initiated")
   amountPaise Int      @map("amount_paise")
+  scenario    String   @default("success")
+  delayMs     Int      @default(10000) @map("delay_ms")
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   finalizedAt DateTime? @map("finalized_at") @db.Timestamptz(6)
   hold        Hold @relation(fields: [holdId], references: [id], onUpdate: Restrict)
@@ -147,6 +149,7 @@ model PaymentAttempt {
 
   @@unique([id, holdId])
   @@index([holdId])
+  @@index([holdId, createdAt(sort: Desc), id(sort: Desc)])
   @@map("payment_attempts")
 }
 
@@ -159,6 +162,7 @@ model PaymentEvent {
   disposition      String   @default("pending")
   receivedAt       DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
   processedAt      DateTime? @map("processed_at") @db.Timestamptz(6)
+  duplicateEventEmitted Boolean @default(false) @map("duplicate_event_emitted")
   paymentAttempt   PaymentAttempt @relation(fields: [paymentAttemptId], references: [id], onUpdate: Restrict)
 
   @@index([paymentAttemptId, receivedAt])

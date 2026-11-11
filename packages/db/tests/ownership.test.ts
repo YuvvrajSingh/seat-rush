@@ -9,6 +9,7 @@ import {
 import { classifyDbError } from "../src/errors.js";
 import { takeOverStaleIdempotency } from "../src/idempotency.js";
 import { seedDemo } from "../src/seed.js";
+import { completeRefund, findPendingRefunds } from "../src/payments.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (!databaseUrl || databaseUrl === process.env.DATABASE_URL) throw new Error("A separate TEST_DATABASE_URL is required");
@@ -375,6 +376,18 @@ describe("ownership regression coverage", () => {
 });
 
 describe("durable payment, reset and diagnostic contracts", () => {
+  it("recovers committed processing refunds and settles concurrent deliveries only once", async () => {
+    const held = await claim(0, ["A1"]);
+    const attempt = await prisma.paymentAttempt.create({ data: { holdId: held.id, amountPaise: held.amountPaise } });
+    await prisma.$executeRaw`UPDATE payment_attempts SET status='succeeded',finalized_at=now() WHERE id=${attempt.id}::uuid`;
+    const refund = await prisma.refundRequired.create({ data: { paymentAttemptId: attempt.id, amountPaise: held.amountPaise, reason: "hold_expired", status: "processing" } });
+    expect(await findPendingRefunds(prisma, { limit: 10 })).toContainEqual({ refundRequiredId: refund.id });
+    expect((await Promise.all([completeRefund(prisma, refund.id), completeRefund(prisma, refund.id)])).sort()).toEqual(["completed", "noop"]);
+    expect((await prisma.refundRequired.findUniqueOrThrow({ where: { id: refund.id } })).status).toBe("refunded");
+    expect(await findPendingRefunds(prisma, { limit: 10 })).toEqual([]);
+    expect(await prisma.domainEvent.count({ where: { kind: "refund.completed", screeningId } })).toBe(1);
+    expect(await completeRefund(prisma, refund.id)).toBe("noop");
+  });
   it("rejects attempts on expired holds and retries after a successful attempt", async () => {
     const expired = await claim(0, ["A1"]);
     await expire(expired.id);
@@ -385,9 +398,9 @@ describe("durable payment, reset and diagnostic contracts", () => {
     await prisma.$executeRaw`UPDATE payment_attempts SET status = 'succeeded', finalized_at = now() WHERE id = ${attempt.id}::uuid`;
     await expect(prisma.paymentAttempt.create({ data: { holdId: live.id, amountPaise: live.amountPaise } }))
       .rejects.toThrow(/valid unpaid hold/);
-    await expect(prisma.refundRequired.create({ data: { paymentAttemptId: attempt.id, amountPaise: 1, reason: "late" } }))
+    await expect(prisma.refundRequired.create({ data: { paymentAttemptId: attempt.id, amountPaise: 1, reason: "hold_expired" } }))
       .rejects.toThrow(/unbooked successful attempt/);
-    await prisma.refundRequired.create({ data: { paymentAttemptId: attempt.id, amountPaise: attempt.amountPaise, reason: "late" } });
+    await prisma.refundRequired.create({ data: { paymentAttemptId: attempt.id, amountPaise: attempt.amountPaise, reason: "hold_expired" } });
     await expect(prisma.booking.create({ data: { holdId: live.id, screeningId, customerId: live.customerId,
       paymentAttemptId: attempt.id, amountPaise: live.amountPaise } }))
       .rejects.toThrow(/unrefunded successful payment/);
@@ -397,11 +410,11 @@ describe("durable payment, reset and diagnostic contracts", () => {
     const failedHold = await claim(0, ["A1"]);
     const failed = await prisma.paymentAttempt.create({ data: { holdId: failedHold.id, amountPaise: failedHold.amountPaise } });
     await prisma.$executeRaw`UPDATE payment_attempts SET status = 'failed', finalized_at = now() WHERE id = ${failed.id}::uuid`;
-    await expect(prisma.refundRequired.create({ data: { paymentAttemptId: failed.id, amountPaise: failed.amountPaise, reason: "late" } }))
+    await expect(prisma.refundRequired.create({ data: { paymentAttemptId: failed.id, amountPaise: failed.amountPaise, reason: "hold_expired" } }))
       .rejects.toThrow(/unbooked successful attempt/);
     const booking = await confirm(await claim(1, ["A2"]));
     await expect(prisma.refundRequired.create({ data: {
-      paymentAttemptId: booking.paymentAttemptId, amountPaise: booking.amountPaise, reason: "late",
+      paymentAttemptId: booking.paymentAttemptId, amountPaise: booking.amountPaise, reason: "hold_expired",
     } })).rejects.toThrow(/unbooked successful attempt/);
     const live = await claim(2, ["A3"]);
     const attempt = await prisma.paymentAttempt.create({ data: { holdId: live.id, amountPaise: live.amountPaise } });
@@ -409,7 +422,7 @@ describe("durable payment, reset and diagnostic contracts", () => {
     const outcomes = await Promise.allSettled([
       prisma.booking.create({ data: { holdId: live.id, screeningId, customerId: live.customerId,
         paymentAttemptId: attempt.id, amountPaise: live.amountPaise } }),
-      prisma.refundRequired.create({ data: { paymentAttemptId: attempt.id, amountPaise: live.amountPaise, reason: "late" } }),
+      prisma.refundRequired.create({ data: { paymentAttemptId: attempt.id, amountPaise: live.amountPaise, reason: "hold_expired" } }),
     ]);
     expect(outcomes.filter((r) => r.status === "fulfilled")).toHaveLength(1);
     for (const result of outcomes) {
@@ -448,7 +461,7 @@ describe("durable payment, reset and diagnostic contracts", () => {
     const late = await claim(2, ["A3"]);
     const attempt = await prisma.paymentAttempt.create({ data: { holdId: late.id, amountPaise: late.amountPaise } });
     await prisma.$executeRaw`UPDATE payment_attempts SET status = 'succeeded', finalized_at = now() WHERE id = ${attempt.id}::uuid`;
-    await prisma.refundRequired.create({ data: { paymentAttemptId: attempt.id, amountPaise: late.amountPaise, reason: "late" } });
+    await prisma.refundRequired.create({ data: { paymentAttemptId: attempt.id, amountPaise: late.amountPaise, reason: "hold_expired" } });
     await prisma.paymentEvent.create({ data: { paymentAttemptId: attempt.id, providerEventId: "reset-event", outcome: "succeeded", payload: {} } });
     await prisma.idempotencyRecord.create({ data: { screeningId, customerId: customers[0]!, operation: "hold.create", key: "reset", requestHash: "hash" } });
     const other = await prisma.screening.create({ data: { title: "Retained", startsAt: new Date("2099-01-01"), durationMinutes: 180, seatPricePaise: SEAT_PRICE_PAISE } });
@@ -503,7 +516,7 @@ describe("durable payment, reset and diagnostic contracts", () => {
     const booking = await confirm(await claim(0, ["A1"]));
     await prisma.$transaction(async (tx) => {
       await tx.$executeRawUnsafe("ALTER TABLE refund_required DISABLE TRIGGER USER");
-      await tx.refundRequired.create({ data: { paymentAttemptId: booking.paymentAttemptId, amountPaise: booking.amountPaise, reason: "corrupt" } });
+      await tx.refundRequired.create({ data: { paymentAttemptId: booking.paymentAttemptId, amountPaise: booking.amountPaise, reason: "hold_expired" } });
       await tx.$executeRawUnsafe("ALTER TABLE refund_required ENABLE TRIGGER USER");
     });
     expect((await checkSeatInvariants(prisma, screeningId)).violations).toContain("1 payment attempts have both a booking and a refund");
