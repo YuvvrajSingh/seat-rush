@@ -8,6 +8,11 @@
       "development": "./src/index.ts",
       "types": "./src/index.ts",
       "default": "./dist/index.js"
+    },
+    "./server": {
+      "development": "./src/server.ts",
+      "types": "./src/server.ts",
+      "default": "./dist/server.js"
     }
   },
   "scripts": {

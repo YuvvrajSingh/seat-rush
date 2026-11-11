@@ -4,7 +4,8 @@ import { apiEnvSchema, EnvValidationError, parseEnv, webEnvSchema, workerEnvSche
 const DATABASE_URL = "postgresql://seatrush:s3cret-pass@localhost:5433/seatrush";
 const REDIS_URL = "redis://localhost:6379";
 const AUTH_TOKEN_SECRET = "0123456789abcdef0123456789abcdef";
-const required = { DATABASE_URL, REDIS_URL, AUTH_TOKEN_SECRET };
+const PAYMENT_WEBHOOK_SECRET = "fedcba9876543210fedcba9876543210";
+const required = { DATABASE_URL, REDIS_URL, AUTH_TOKEN_SECRET, PAYMENT_WEBHOOK_SECRET };
 
 function parseError(run: () => unknown): EnvValidationError {
   try {
@@ -27,6 +28,7 @@ describe("parseEnv(apiEnvSchema)", () => {
       WEB_ORIGIN: "http://localhost:3000",
       API_DB_POOL_MAX: 20,
       AUTH_TOKEN_SECRET,
+      PAYMENT_WEBHOOK_SECRET,
     });
   });
 
@@ -49,7 +51,12 @@ describe("parseEnv(apiEnvSchema)", () => {
 
   it("reports every missing required variable at once", () => {
     const error = parseError(() => parseEnv(apiEnvSchema, { DATABASE_URL: "" }));
-    expect(error.issues).toEqual(["REDIS_URL: required", "DATABASE_URL: required", "AUTH_TOKEN_SECRET: required"]);
+    expect(error.issues).toEqual([
+      "REDIS_URL: required",
+      "DATABASE_URL: required",
+      "AUTH_TOKEN_SECRET: required",
+      "PAYMENT_WEBHOOK_SECRET: required",
+    ]);
   });
 
   it("rejects a short AUTH_TOKEN_SECRET without echoing it", () => {
@@ -101,18 +108,27 @@ describe("parseEnv(apiEnvSchema)", () => {
 });
 
 describe("parseEnv(workerEnvSchema)", () => {
-  it("requires Postgres and Redis for transactional expiry processing", () => {
-    expect(parseEnv(workerEnvSchema, { DATABASE_URL, REDIS_URL: "rediss://cache.example:6380" })).toEqual({
+  it("requires Postgres, Redis and the payment secret; defaults the notification URL", () => {
+    expect(
+      parseEnv(workerEnvSchema, { DATABASE_URL, REDIS_URL: "rediss://cache.example:6380", PAYMENT_WEBHOOK_SECRET }),
+    ).toEqual({
       NODE_ENV: "development",
       LOG_LEVEL: "info",
       REDIS_URL: "rediss://cache.example:6380",
       DATABASE_URL,
+      PAYMENT_WEBHOOK_SECRET,
+      PAYMENT_NOTIFICATION_URL: "http://localhost:4000/payments/notifications",
     });
   });
 
-  it("reports the required database without echoing credentials", () => {
-    expect(parseError(() => parseEnv(workerEnvSchema, { REDIS_URL })).issues).toEqual(["DATABASE_URL: required"]);
-    const error = parseError(() => parseEnv(workerEnvSchema, { REDIS_URL, DATABASE_URL: "mysql://secret@db/worker" }));
+  it("reports missing variables without echoing credentials", () => {
+    expect(parseError(() => parseEnv(workerEnvSchema, { REDIS_URL })).issues).toEqual([
+      "DATABASE_URL: required",
+      "PAYMENT_WEBHOOK_SECRET: required",
+    ]);
+    const error = parseError(() =>
+      parseEnv(workerEnvSchema, { REDIS_URL, PAYMENT_WEBHOOK_SECRET, DATABASE_URL: "mysql://secret@db/worker" }),
+    );
     expect(error.issues).toEqual(["DATABASE_URL: must be a postgres:// or postgresql:// URL"]);
     expect(error.message).not.toContain("secret");
   });

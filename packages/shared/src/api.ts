@@ -54,6 +54,12 @@ export const ERROR_CODES = [
   "retry_later",
   /** 429: the demo session issuance limit for this IP has been reached. */
   "rate_limited",
+  /** 409: the hold already has an unresolved (initiated) payment attempt (FR-04). */
+  "payment_in_progress",
+  /** 409: the hold is already paid and confirmed. */
+  "already_confirmed",
+  /** 401: a payment-provider notification failed signature verification. */
+  "invalid_signature",
   "internal_error",
 ] as const;
 export const ErrorCodeSchema = z.enum(ERROR_CODES);

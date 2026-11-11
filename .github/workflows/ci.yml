@@ -54,11 +54,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Generate a per-run auth token secret
+      - name: Generate per-run secrets
         run: |
-          secret="$(openssl rand -hex 32)"
-          echo "::add-mask::$secret"
-          echo "AUTH_TOKEN_SECRET=$secret" >> "$GITHUB_ENV"
+          for name in AUTH_TOKEN_SECRET PAYMENT_WEBHOOK_SECRET; do
+            secret="$(openssl rand -hex 32)"
+            echo "::add-mask::$secret"
+            echo "$name=$secret" >> "$GITHUB_ENV"
+          done
 
       # No version input: pnpm/action-setup reads packageManager from package.json.
       - uses: pnpm/action-setup@v6

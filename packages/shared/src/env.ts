@@ -41,12 +41,19 @@ export const apiEnvSchema = z.object({
   API_DB_POOL_MAX: optionalVar(z.coerce.number().int().positive().default(20)),
   /** HMAC key for demo bearer tokens; generate with `openssl rand -hex 32`. */
   AUTH_TOKEN_SECRET: z.string().min(32, { error: "must be at least 32 characters" }),
+  /** HMAC key the payment simulator signs notifications with; generate with `openssl rand -hex 32`. */
+  PAYMENT_WEBHOOK_SECRET: z.string().min(32, { error: "must be at least 32 characters" }),
 });
 export type ApiEnv = z.infer<typeof apiEnvSchema>;
 
 export const workerEnvSchema = z.object({
   ...baseServerEnv,
   DATABASE_URL: optionalVar(postgresUrl),
+  PAYMENT_WEBHOOK_SECRET: z.string().min(32, { error: "must be at least 32 characters" }),
+  /** Where the payment simulator delivers notifications (the API's POST /payments/notifications). */
+  PAYMENT_NOTIFICATION_URL: optionalVar(
+    z.url({ protocol: /^https?$/, error: "must be an http:// or https:// URL" }).default("http://localhost:4000/payments/notifications"),
+  ),
 });
 export type WorkerEnv = z.infer<typeof workerEnvSchema>;
 
