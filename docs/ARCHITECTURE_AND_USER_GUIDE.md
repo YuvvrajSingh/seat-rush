@@ -53,58 +53,65 @@ The following Mermaid diagram illustrates the exact component relationships, pro
 
 ```mermaid
 flowchart TB
-    subgraph Client["Browser Tier"]
-        UI["Next.js 16 App Router\n(Port 3000)"]
-        Store["useBooking Store\nClock Skew Sync"]
+    classDef client fill:#e0f2fe,stroke:#0284c7,stroke-width:1.5px,color:#0f172a;
+    classDef api fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#0f172a;
+    classDef queue fill:#ffe4e6,stroke:#e11d48,stroke-width:1.5px,color:#0f172a;
+    classDef worker fill:#d1fae5,stroke:#059669,stroke-width:1.5px,color:#0f172a;
+    classDef db fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#0f172a;
+
+    subgraph Client["Client Tier"]
+        UI["Next.js 16 Web Application<br/>(Port 3000 / React 19)"]:::client
+        Store["useBooking Store & Countdown<br/>(Clock Skew Synchronization)"]:::client
     end
 
-    subgraph API["API Tier (Express 5 - Port 4000)"]
-        Router["Express Router\nCORS / Auth / Rate Limit"]
-        Idemp["Idempotency Fencing\n30s Lease / Request Hash"]
-        BookingSvc["Booking Service\nwithDbRetry()"]
-        PaymentSvc["Payment Service\nHMAC Signature Verification"]
+    subgraph API["API Gateway & Coordinator"]
+        Router["Express 5 HTTP Router<br/>(Port 4000 / CORS & Auth)"]:::api
+        Idemp["Idempotency Fencing<br/>(30s Lease & Hash Validation)"]:::api
+        BookingSvc["Booking Service<br/>(withDbRetry & SQL Orchestration)"]:::api
+        PaymentSvc["Payment Service<br/>(HMAC Signature & State Guard)"]:::api
     end
 
-    subgraph Queues["Async Messaging Tier (Redis 8 - Port 6379)"]
-        QExpiry["Queue: hold-expiry"]
-        QPayment["Queue: payment-events\n(Concurrency: 32)"]
-        QRefund["Queue: refunds\n(Concurrency: 8)"]
-        QRecon["Queue: payment-reconciliation\n(Every 30s)"]
-        PubSub["Pub/Sub: seatrush:conflicts"]
+    subgraph Queues["Distributed Queues & PubSub"]
+        QExpiry[("BullMQ: hold-expiry<br/>(Concurrency: 1 / 5m Delayed)")]:::queue
+        QPayment[("BullMQ: payment-events<br/>(Concurrency: 32 / Async Sim)")]:::queue
+        QRefund[("BullMQ: refunds<br/>(Concurrency: 8 / Compensating)")]:::queue
+        QRecon[("BullMQ: payment-reconciliation<br/>(Repeat Every 30s)")]:::queue
+        PubSub[("Redis 8 Pub/Sub Stream<br/>(seatrush:conflicts Windows)")]:::queue
     end
 
-    subgraph Workers["Worker Daemon Tier"]
-        BullWorker["BullMQ Processors"]
-        SimEngine["Payment Simulator Engine\n(6 Scenarios)"]
-        Sweeper["Reconciliation Sweeper\n(Stalled Attempts & Expired Holds)"]
+    subgraph Workers["Worker Daemons"]
+        BullWorker["BullMQ Worker Daemon<br/>(Queue Dispatcher)"]:::worker
+        SimEngine["Payment Simulator Engine<br/>(6 Realistic Chaos Scenarios)"]:::worker
+        Sweeper["Reconciliation Sweeper<br/>(30s Periodic Safety Net)"]:::worker
     end
 
-    subgraph Database["Storage Authority Tier (PostgreSQL 18 - Port 5433)"]
-        SeatsTable["seats & hold_items\n(FOR NO KEY UPDATE)"]
-        HoldsTable["holds\n(GiST Exclusion / 5-min Window)"]
-        BookingsTable["bookings & booked_seats\n(Unique Ticket Codes)"]
-        PaymentsTable["payment_attempts & payment_events\n(Absorbing State Trigger)"]
-        EventCursor["screening_event_cursors\n(Monotonic Sequence Counter)"]
-        IdempTable["idempotency_records\n(Scoped Hash & Retention)"]
+    subgraph Database["Authoritative PostgreSQL"]
+        SeatsTable[("seats & hold_items<br/>(Row Locks: FOR NO KEY UPDATE)")]:::db
+        HoldsTable[("holds Table<br/>(GiST Exclusion / 5-min Window)")]:::db
+        BookingsTable[("bookings & booked_seats<br/>(Unique Ticket Constraints)")]:::db
+        PaymentsTable[("payment_attempts & events<br/>(Absorbing State Machine Triggers)")]:::db
+        EventCursor[("screening_event_cursors<br/>(Monotonic Sequence Counter)")]:::db
+        IdempTable[("idempotency_records<br/>(Scoped Fencing & Lease Tokens)")]:::db
     end
 
-    UI -->|1. POST /auth/demo-session| Router
-    UI -->|2. GET /screenings/:id/snapshot| Router
-    UI -->|3. POST /screenings/:id/holds\n(Idempotency-Key)| Router
-    UI -->|4. POST /holds/:id/payments\n(Scenario)| Router
+    UI -->|"1. POST /auth/demo-session<br/>(Signed HMAC Token)"| Router
+    UI -->|"2. GET /screenings/:id/snapshot<br/>(10x10 Seat Matrix)"| Router
+    UI -->|"3. POST /screenings/:id/holds<br/>(Idempotency-Key Header)"| Router
+    UI -->|"4. POST /holds/:id/payments<br/>(Chaos Scenario Payload)"| Router
+    Store -.->|"Manages selection &<br/>clock skew offset"| UI
 
-    Router --> Idemp
-    Idemp --> IdempTable
-    Router --> BookingSvc
-    Router --> PaymentSvc
+    Router -->|"Acquire 30s lease"| Idemp
+    Idemp -->|"Check hash & write lease"| IdempTable
+    Router -->|"Orchestrate hold & release"| BookingSvc
+    Router -->|"Orchestrate payment lifecycle"| PaymentSvc
 
-    BookingSvc -->|claim_seats()| SeatsTable
-    BookingSvc -->|claim_seats()| HoldsTable
-    BookingSvc -->|Best-effort delayed job| QExpiry
-    BookingSvc -.->|Record conflict counts| PubSub
+    BookingSvc -->|"SELECT claim_seats()<br/>(Ordered row-level locks)"| SeatsTable
+    BookingSvc -->|"INSERT active hold<br/>(GiST exclusion constraint)"| HoldsTable
+    BookingSvc -.->|"Best-effort enqueue<br/>(delay: 5m)"| QExpiry
+    BookingSvc -.->|"Broadcast conflict count<br/>(100ms aggregation)"| PubSub
 
-    PaymentSvc -->|startPayment()| PaymentsTable
-    PaymentSvc -->|Enqueue simulation job| QPayment
+    PaymentSvc -->|"INSERT payment_attempts<br/>(status: 'initiated')"| PaymentsTable
+    PaymentSvc -.->|"Enqueue simulation job"| QPayment
 
     QExpiry --> BullWorker
     QPayment --> BullWorker
@@ -114,14 +121,15 @@ flowchart TB
     BullWorker --> SimEngine
     BullWorker --> Sweeper
 
-    SimEngine -->|POST /payments/notifications\n(HMAC-SHA256 Signed)| PaymentSvc
-    PaymentSvc -->|applyNotification()| PaymentsTable
-    PaymentSvc -->|Confirm Booking| BookingsTable
-    PaymentSvc -->|Confirm Booking| EventCursor
-    PaymentSvc -->|Late Success -> refund_required| QRefund
+    SimEngine -->|"POST /payments/notifications<br/>(HMAC-SHA256 Signed Webhook)"| PaymentSvc
+    PaymentSvc -->|"applyNotification()<br/>(Absorbing state trigger)"| PaymentsTable
+    PaymentSvc -->|"INSERT booking & booked_seats<br/>(Generate ticket codes)"| BookingsTable
+    PaymentSvc -->|"Lock cursor FOR UPDATE<br/>& emit domain event"| EventCursor
+    PaymentSvc -.->|"Late success -> enqueue refund"| QRefund
 
-    Sweeper -->|findStalledPaymentAttempts()| PaymentsTable
-    Sweeper -->|cleanup_expired_hold()| SeatsTable
+    Sweeper -->|"findStalledPaymentAttempts()<br/>(Resume unapplied >30s attempts)"| PaymentsTable
+    Sweeper -->|"cleanup_expired_hold()<br/>(Reclaim inventory from dead locks)"| SeatsTable
+    Sweeper -->|"Check expired active holds"| HoldsTable
 ```
 
 ### 1.3 Package Structure & Monorepo Boundaries
@@ -150,6 +158,151 @@ seat-rush/
 ## 2. Visual User Guide & Step-by-Step Systems Walkthrough
 
 Every visual interaction in SeatRush maps to a concrete systems programming pattern. The following walkthrough explains what is happening under the hood across all eight screens.
+
+### 2.0 Complete End-to-End User Transaction Journey
+
+The sequence diagram below provides a panoramic view of the entire eight-stage transaction lifecycle—from initial anonymous session provisioning and seat map caching to atomic conditional holding, asynchronous payment simulation, absorbing state machine verification, and printable ticket rendering:
+
+```mermaid
+sequenceDiagram
+    autonumber
+
+    box rgba(224, 242, 254, 0.7) "Client Browser Tier"
+        actor User as Customer Browser
+        participant Web as Next.js 16 Web UI
+    end
+
+    box rgba(254, 243, 199, 0.7) "API Gateway & Coordinator"
+        participant API as Express 5 API
+    end
+
+    box rgba(243, 232, 255, 0.7) "Authoritative PostgreSQL 18"
+        participant DB as PostgreSQL 18 Engine
+    end
+
+    box rgba(209, 250, 229, 0.7) "Worker & Simulation Tier"
+        participant Queue as BullMQ / Redis 8
+        participant Worker as Worker & Payment Simulator
+    end
+
+    %% Phase 1: Session Minting
+    Note over User,Worker: Phase 1: Session Minting (Screen 1 & 2)
+    User->>Web: Navigate to /book (No demo token present)
+    activate Web
+    Web->>API: POST /auth/demo-session
+    activate API
+    API->>DB: INSERT INTO identities (demo_key, role, display_name)
+    activate DB
+    DB-->>API: Row created (customer_id: UUID)
+    deactivate DB
+    API-->>Web: 200 OK (HMAC-SHA256 Signed Bearer Token)
+    deactivate API
+    Web->>Web: Persist token to sessionStorage
+    deactivate Web
+
+    %% Phase 2: Seat Map Fetch
+    Note over User,Worker: Phase 2: Seat Map Snapshot (Screen 2)
+    Web->>API: GET /screenings/:id/snapshot
+    activate Web
+    activate API
+    API->>DB: SELECT seats, active holds, booked_seats
+    activate DB
+    DB-->>API: 100-Seat Matrix + serverTime timestamp
+    deactivate DB
+    API-->>Web: 200 OK { screening, seats, serverTime }
+    deactivate API
+    Web->>Web: Compute clockOffsetMs = (sent + received)/2 - serverTime
+    Web-->>User: Render accessible 10x10 DOM seat grid
+    deactivate Web
+
+    %% Phase 3: Local Selection
+    Note over User,Worker: Phase 3: Local Seat Selection (Screen 3 - Zero Server Load)
+    User->>Web: Click seats D4, D5, D6
+    activate Web
+    Note over Web: Local React State Update (anti-hoarding)<br/>Zero DB locks, zero network requests
+    Web-->>User: Highlight yellow ("Selected"), show subtotal ₹1,050.00
+    deactivate Web
+
+    %% Phase 4: Atomic Hold
+    Note over User,Worker: Phase 4: Atomic Hold & Countdown (Screen 4)
+    User->>Web: Click "Hold seats (5:00)"
+    activate Web
+    Web->>API: POST /screenings/:id/holds<br/>Headers: Idempotency-Key, Bearer Token<br/>Body: { seatIds: [D4, D5, D6] }
+    activate API
+    API->>DB: BEGIN TRANSACTION (Read Committed)
+    activate DB
+    API->>DB: Reserve 30s Idempotency Lease (idempotency_records)
+    API->>DB: SELECT claim_seats(screening_id, customer_id, seat_ids)
+    Note over DB: 1. SELECT seats ORDER BY id FOR NO KEY UPDATE<br/>2. GiST constraint: No active hold for customer<br/>3. UPDATE seats SET current_hold_id = h.id
+    DB-->>API: Hold row created (hold_id, expires_at: T+5m)
+    API->>DB: Record completed response in idempotency_records
+    API->>DB: COMMIT TRANSACTION
+    deactivate DB
+    API-)Queue: Best-effort enqueue hold-expiry (delay: 5m)
+    API-->>Web: 201 Created { holdId, expiresAt, serverTime, seats }
+    deactivate API
+    Web->>Web: Start synchronized countdown timer (5:00) with clockOffsetMs
+    Web-->>User: Display "Held for you" countdown panel
+    deactivate Web
+
+    %% Phase 5: Payment Initiation
+    Note over User,Worker: Phase 5: Payment Initiation (Screen 5)
+    User->>Web: Select "delayed_success" & click "Pay ₹1,050.00"
+    activate Web
+    Web->>API: POST /holds/:id/payments<br/>Body: { scenario: "delayed_success" }
+    activate API
+    API->>DB: INSERT INTO payment_attempts (status: 'initiated')
+    activate DB
+    DB-->>API: Attempt created (attempt_id: UUID)
+    deactivate DB
+    API-)Queue: Enqueue simulation job in payment-events queue
+    API-->>Web: 202 Accepted { attemptId, status: "initiated" }
+    deactivate API
+    Web-->>User: Display animated processing spinner
+    deactivate Web
+
+    %% Phase 6: Simulator Delivery
+    Note over User,Worker: Phase 6: Async Webhook Simulation Delivery
+    Queue-)Worker: Pull delayed simulation job (T+10s)
+    activate Worker
+    Note over Worker: Compute webhook payload<br/>Generate HMAC-SHA256 signature
+    Worker->>API: POST /payments/notifications<br/>Header: x-seatrush-signature<br/>Body: { attemptId, outcome: "succeeded" }
+    activate API
+    API->>API: verifyPaymentNotification() via crypto.timingSafeEqual
+
+    %% Phase 7: Booking Confirmation
+    Note over User,Worker: Phase 7: Booking Confirmation & Absorbing State Commit
+    API->>DB: BEGIN TRANSACTION
+    activate DB
+    API->>DB: applyNotification() / guard_payment_transition()
+    Note over DB: 1. SELECT holds FOR UPDATE (assert expires_at > now())<br/>2. INSERT INTO bookings & booked_seats<br/>3. Lock screening_event_cursors FOR UPDATE<br/>4. INSERT INTO domain_events ('booking.confirmed')<br/>5. UPDATE payment_attempts SET status = 'succeeded'
+    DB-->>API: Confirmation successful (booking_id: UUID)
+    API->>DB: COMMIT TRANSACTION
+    deactivate DB
+    API-->>Worker: 200 OK { disposition: "applied", bookingId }
+    deactivate API
+    deactivate Worker
+
+    %% Phase 8: Ticket Rendering
+    Note over User,Worker: Phase 8: Ticket Rendering & Admission Pass (Screen 7 & 8)
+    Web->>API: GET /screenings/:id/snapshot
+    activate Web
+    activate API
+    API-->>Web: 200 OK (Seats transition from "held" to "booked")
+    deactivate API
+    Web->>API: GET /bookings/:bookingId
+    activate API
+    API->>DB: SELECT * FROM bookings WHERE id = $1 AND customer_id = $2
+    activate DB
+    DB-->>API: Booking record with ticket codes and amount
+    deactivate DB
+    API-->>Web: 200 OK { bookingId, reference, seats, amountPaise }
+    deactivate API
+    Web-->>User: Render Photorealistic Cinema Ticket Stub (Screen 7)
+    User->>Web: Click "View printable ticket" (/bookings/:id)
+    Web-->>User: Render High-Contrast Black & White Admission Pass (Screen 8)
+    deactivate Web
+```
 
 ---
 
@@ -226,33 +379,40 @@ This single user action triggers one of the most sophisticated transactional wor
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as Client Browser
-    participant API as Express API
-    participant DB as PostgreSQL 18
-    participant Redis as Redis / BullMQ
-
-    User->>API: POST /screenings/:id/holds<br/>Headers: Idempotency-Key, Bearer Token<br/>Body: { seatIds: [D4, D5, D6] }
-    Note over API,DB: Start Read Committed Transaction
-    API->>DB: Acquire 30s Idempotency Lease (idempotency_records)
-    API->>DB: SELECT claim_seats(screening_id, customer_id, seat_ids)
-    
-    rect rgb(240, 248, 255)
-        Note over DB: claim_seats() Execution
-        DB->>DB: 1. SELECT screenings FOR KEY SHARE
-        DB->>DB: 2. SELECT identities FOR NO KEY UPDATE
-        DB->>DB: 3. SELECT holds (prior owners) ORDER BY id FOR NO KEY UPDATE
-        DB->>DB: 4. SELECT seats ORDER BY id FOR NO KEY UPDATE
-        DB->>DB: 5. Verify no active hold exists for customer (GiST)
-        DB->>DB: 6. INSERT INTO holds & hold_items
-        DB->>DB: 7. UPDATE seats SET current_hold_id = h.id RETURNING s.id
+    box rgba(224, 242, 254, 0.7) "Client Browser"
+        actor User as Client Browser
+    end
+    box rgba(254, 243, 199, 0.7) "API Gateway & Coordinator"
+        participant API as Express API
+    end
+    box rgba(243, 232, 255, 0.7) "Authoritative PostgreSQL 18"
+        participant DB as PostgreSQL 18
+    end
+    box rgba(209, 250, 229, 0.7) "Distributed Messaging"
+        participant Redis as Redis / BullMQ
     end
 
+    User->>API: POST /screenings/:id/holds<br/>Headers: Idempotency-Key, Bearer Token<br/>Body: { seatIds: [D4, D5, D6] }
+    activate API
+    Note over API,DB: Start Read Committed Transaction
+    API->>DB: Acquire 30s Idempotency Lease (idempotency_records)
+    activate DB
+    DB-->>API: Lease granted (status: in_progress)
+    API->>DB: SELECT claim_seats(screening_id, customer_id, seat_ids)
+    
+    rect rgba(243, 232, 255, 0.5)
+        Note over DB: Atomic claim_seats() Execution<br/>1. SELECT screenings FOR KEY SHARE<br/>2. SELECT identities FOR NO KEY UPDATE<br/>3. SELECT holds (prior owners) ORDER BY id FOR NO KEY UPDATE<br/>4. SELECT seats ORDER BY id FOR NO KEY UPDATE (deadlock prevention)<br/>5. Verify no active hold exists for customer (GiST exclusion)<br/>6. INSERT INTO holds & hold_items (5-minute TTL)<br/>7. UPDATE seats SET current_hold_id = h.id RETURNING s.id
+    end
+
+    DB-->>API: Returns claimed seat IDs (D4, D5, D6)
     API->>DB: Store completed 201 response in idempotency_records
-    API->>DB: Commit Transaction
-    Note over API,DB: Transaction Committed
+    API->>DB: COMMIT Transaction
+    deactivate DB
+    Note over API,DB: Transaction Committed Durably
     API-)Redis: Best-effort enqueue delayed job (hold-expiry, delay: 5m)
     API-->>User: 201 Created { holdId, expiresAt, serverTime, seats }
-    Note over User: Calculate clockOffsetMs<br/>Start countdown timer
+    deactivate API
+    Note over User: Calculate clockOffsetMs<br/>Start synchronized countdown timer
 ```
 
 1. **Idempotency Lease Fencing (`apps/api/src/idempotency.ts`):**
@@ -517,28 +677,56 @@ To guarantee that inventory is never permanently leaked, SeatRush implements a d
 
 ```mermaid
 flowchart TD
-    subgraph Suspender["Layer 1: The Suspender (Queue Wake-up)"]
-        H1["Hold Created at T=0"] -->|Enqueue delayed BullMQ job| Q["BullMQ Queue (delay: 5m)"]
-        Q -->|Job fires at T=5m| W1["Worker invokes cleanup_expired_hold()"]
+    classDef fast fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#0f172a;
+    classDef healing fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#0f172a;
+    classDef db fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#0f172a;
+    classDef decision fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#0f172a;
+    classDef terminal fill:#f1f5f9,stroke:#475569,stroke-width:1.5px,color:#0f172a;
+
+    subgraph FastPath["Branch 1: The Fast Path (Event-Driven BullMQ Delayed Jobs)"]
+        H1["Hold Created at T=0<br/>(5-Minute Expiry Window)"]:::fast
+        Q[("BullMQ: hold-expiry Queue<br/>(Redis 8 AOF Transport / delay: 5m)")]:::fast
+        W1["BullMQ Expiry Worker<br/>(Job fires precisely at T=5m)"]:::fast
+        
+        H1 -->|"1a. Best-effort enqueue<br/>(holdId, delay: 300000ms)"| Q
+        Q -->|"1b. Delayed job wake-up<br/>Targeted single hold"| W1
     end
 
-    subgraph Belt["Layer 2: The Belt (PostgreSQL 30s Sweeper)"]
-        Timer["Every 30 Seconds\n(payment-reconciliation)"] --> Sweep["Database Expiry Sweep"]
-        Sweep --> Query["SELECT id FROM holds\nWHERE status = 'active'\nAND expires_at <= now()\nLIMIT 500"]
-        Query --> W2["Worker invokes cleanup_expired_hold()"]
+    subgraph HealingPath["Branch 2: The Self-Healing Path (30s Database Reconciliation Sweeps)"]
+        Timer["Deterministic 30s Timer<br/>(payment-reconciliation queue)"]:::healing
+        Sweep["startExpirySweep() Engine<br/>(Scheduled Sweeper Loop)"]:::healing
+        Query[("Direct PostgreSQL Query<br/>SELECT id FROM holds WHERE<br/>status = 'active' AND expires_at &lt;= now()")]:::healing
+        W2["Reconciliation Sweeper Worker<br/>(Rescues orphaned / stalled holds)"]:::healing
+
+        Timer -->|"2a. 30-second interval pulse"| Sweep
+        Sweep -->|"2b. Direct table query<br/>(bypasses Redis state)"| Query
+        Query -->|"2c. Batch up to 500 expired IDs"| W2
     end
 
-    subgraph Authority["PostgreSQL Atomic Cleanup"]
-        W1 --> CleanupFn["cleanup_expired_hold(hold_id)"]
-        W2 --> CleanupFn
-        CleanupFn --> Verify["Check: status = 'active' AND expires_at <= now()"]
-        Verify --> Clear["UPDATE seats SET current_hold_id = NULL\nWHERE current_hold_id = hold_id\nRETURNING cleared seats"]
-        Clear --> Event["Emit hold.expired Event"]
+    subgraph Authority["PostgreSQL Authoritative Kernel (Transactional Guard)"]
+        CleanupFn["Stored Procedure: cleanup_expired_hold(p_hold_id)<br/>(Acquires FOR NO KEY UPDATE on hold row)"]:::db
+        VerifyHold{"Guard Condition:<br/>status == 'active'<br/>AND expires_at &lt;= now()?"}:::decision
+        Clear[("UPDATE seats<br/>SET current_hold_id = NULL<br/>WHERE current_hold_id = hold_id")]:::db
+        UpdateHold["UPDATE holds<br/>SET status = 'expired'"]:::db
+        EmitEvent[("INSERT INTO domain_events<br/>(kind: 'hold.expired')")]:::db
+        Restored(["Seats Restored to Live Pool<br/>Available for Immediate Re-Hold"]):::terminal
+        NoOp(["NO-OP Safe Return<br/>(Zero Mutations / Anti-Corruption)"]):::terminal
+
+        W1 -->|"Pass hold_id"| CleanupFn
+        W2 -->|"Pass hold_id"| CleanupFn
+
+        CleanupFn --> VerifyHold
+        VerifyHold -->|"YES: Window Has Expired"| Clear
+        Clear --> UpdateHold
+        UpdateHold --> EmitEvent
+        EmitEvent --> Restored
+        
+        VerifyHold -->|"NO: Early Wake-up<br/>or Already Cleaned"| NoOp
     end
 ```
 
-1. **Layer 1 (The Suspender - Fast Path):** BullMQ delivers the delayed job right on the 5-minute mark, instantly releasing the seats.
-2. **Layer 2 (The Belt - Safety Net):** Every 30 seconds, `startExpirySweep()` queries the database directly:
+1. **Branch 1 (The Suspender - Fast Path):** BullMQ delivers the delayed job right on the 5-minute mark, instantly releasing the seats.
+2. **Branch 2 (The Belt - Self-Healing Safety Net):** Every 30 seconds, `startExpirySweep()` queries the database directly:
    ```sql
    SELECT id FROM holds
    WHERE status = 'active' AND expires_at <= now()

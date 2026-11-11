@@ -10,6 +10,7 @@
    - [The Physical Reality: The Thundering Herd at Seat A7](#the-physical-reality-the-thundering-herd-at-seat-a7)
    - [Why Naive "Check-Then-Act" Fails (TOCTOU & Lost Updates)](#why-naive-check-then-act-fails-toctou--lost-updates)
    - [The Double-Allocation Failure Mode](#the-double-allocation-failure-mode)
+   - [Visualizing the Race: Naive TOCTOU vs. Pessimistic Serialization](#visualizing-the-race-naive-toctou-vs-pessimistic-serialization)
 2. [PostgreSQL MVCC & Isolation Levels](#2-postgresql-mvcc--isolation-levels)
    - [Multi-Version Concurrency Control (MVCC) Mechanics](#multi-version-concurrency-control-mvcc-mechanics)
    - [Read Committed vs. Serializable: The Abort Storm Dilemma](#read-committed-vs-serializable-the-abort-storm-dilemma)
@@ -24,6 +25,7 @@
    - [Step-by-Step Breakdown of `claim_seats(...)`](#step-by-step-breakdown-of-claim_seats)
    - [Conditional CTE Updates and `SR409` Conflict Signaling](#conditional-cte-updates-and-sr409-conflict-signaling)
 5. [Database Invariants & Defensive Constraints](#5-database-invariants--defensive-constraints)
+   - [Relational Schema & Entity Relationships](#relational-schema--entity-relationships)
    - [The Immutable Hold Clock: `CHECK` + `BEFORE INSERT/UPDATE` Triggers](#the-immutable-hold-clock-check--before-insertupdate-triggers)
    - [Temporal Exclusion Constraints: `EXCLUDE USING gist`](#temporal-exclusion-constraints-exclude-using-gist)
    - [Deferred Integrity Constraints: `assert_hold_integrity`](#deferred-integrity-constraints-assert_hold_integrity)
@@ -42,7 +44,7 @@
    - [Two-Phase Fenced Leases (`locked_until` & Fencing Tokens)](#two-phase-fenced-leases-locked_until--fencing-tokens)
    - [Savepoints & 4xx Conflict Retention](#savepoints--4xx-conflict-retention)
 9. [Visual System Architecture & Mermaid Diagrams](#9-visual-system-architecture--mermaid-diagrams)
-   - [Entity State Machine Transitions](#entity-state-machine-transitions)
+   - [Hold & Payment Entity State Machines](#hold--payment-entity-state-machines)
    - [Pessimistic Lock Acquisition Hierarchy](#pessimistic-lock-acquisition-hierarchy)
    - [Race Condition Sequence: Late Payment vs. Hold Expiry](#race-condition-sequence-late-payment-vs-hold-expiry)
 10. [Walking the User Journey Through SeatRush](#10-walking-the-user-journey-through-seatrush)
@@ -121,6 +123,125 @@ When these customers pay, the theater has accepted payment for 50 tickets on 1 p
 SeatRush prevents this entirely by enforcing that **PostgreSQL is the single, authoritative arbiter of truth**. Redis and queues are never allowed to decide or cache inventory ownership. When two or more requests collide on the same seat, exactly one succeeds and all others immediately receive a structured `409 Conflict`.
 
 ![Seat Conflict 409](screenshots/06-seat-conflict-409.png)
+
+### Visualizing the Race: Naive TOCTOU vs. Pessimistic Serialization
+
+To grasp how concurrency bugs manifest in real time, compare the naive application-level check against SeatRush's database-level serialization:
+
+#### The Naive Check-Then-Act Failure (TOCTOU)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    box #f1f5f9 "Client Applications"
+        actor Alice as Customer Alice (Thread 1)
+        actor Bob as Customer Bob (Thread 2)
+    end
+    box #ede9fe "Relational Database (Unsynchronized)"
+        participant DB as PostgreSQL (Read Committed)
+    end
+
+    Note over Alice, Bob: Both Alice and Bob target Seat A7 simultaneously
+    Alice->>DB: 1. SELECT current_hold_id FROM seats WHERE label = 'A7'
+    activate DB
+    DB-->>Alice: current_hold_id: NULL (Seat is available!)
+    deactivate DB
+
+    Bob->>DB: 1. SELECT current_hold_id FROM seats WHERE label = 'A7'
+    activate DB
+    DB-->>Bob: current_hold_id: NULL (Seat is available!)
+    deactivate DB
+
+    Note over Alice, Bob: TOCTOU Vulnerability Window:<br/>Both threads believe Seat A7 is vacant!
+
+    Alice->>DB: 2. INSERT INTO holds (seat_count=1) -> Hold H1
+    activate DB
+    DB-->>Alice: Hold H1 Created
+    deactivate DB
+
+    Bob->>DB: 2. INSERT INTO holds (seat_count=1) -> Hold H2
+    activate DB
+    DB-->>Bob: Hold H2 Created
+    deactivate DB
+
+    Alice->>DB: 3. UPDATE seats SET current_hold_id = 'H1' WHERE label = 'A7'
+    activate DB
+    DB-->>Alice: 1 Row Updated (Alice holds Seat A7)
+    deactivate DB
+
+    Note over Bob, DB: LOST UPDATE OCCURS HERE!<br/>Bob's update blindly overwrites Alice's pointer
+    Bob->>DB: 4. UPDATE seats SET current_hold_id = 'H2' WHERE label = 'A7'
+    activate DB
+    DB-->>Bob: 1 Row Updated (Bob overwrites Seat A7!)
+    deactivate DB
+
+    Note over Alice, Bob: CATASTROPHIC DOUBLE ALLOCATION!<br/>Two customers hold confirmations for one physical chair.<br/>When both pay, the venue suffers an impossible double-booking.
+```
+
+#### SeatRush Atomic Serialization via Pessimistic Row Lock (`claim_seats`)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    box #f1f5f9 "Client Applications"
+        actor Alice as Customer Alice (Tx 1)
+        actor Bob as Customer Bob (Tx 2)
+    end
+    box #ede9fe "PostgreSQL Engine (Pessimistic Concurrency)"
+        participant LockMgr as Row Lock Manager
+        participant DB as Inventory Engine (EvalPlanQual)
+    end
+
+    Note over Alice, Bob: Both customers compete for Seat A7 via claim_seats()
+    Alice->>DB: BEGIN Tx 1 (Read Committed)
+    Bob->>DB: BEGIN Tx 2 (Read Committed)
+
+    Alice->>DB: SELECT id FROM seats WHERE label = 'A7' FOR NO KEY UPDATE
+    activate DB
+    DB->>LockMgr: Request TupleNoKeyUpdateLock(Seat A7)
+    activate LockMgr
+    LockMgr-->>DB: Lock Granted to Tx 1
+    deactivate LockMgr
+    DB-->>Alice: Seat A7 locked exclusively for update
+    deactivate DB
+
+    Bob->>DB: SELECT id FROM seats WHERE label = 'A7' FOR NO KEY UPDATE
+    activate DB
+    DB->>LockMgr: Request TupleNoKeyUpdateLock(Seat A7)
+    activate LockMgr
+    Note over Bob, LockMgr: CONFLICT DETECTED!<br/>Tx 2 blocks and sleeps waiting for Tx 1
+    LockMgr-->>Bob: [BLOCKED / SLEEPING]
+    deactivate LockMgr
+    deactivate DB
+
+    Note over Alice, DB: Tx 1 executes within atomic hold window
+    Alice->>DB: INSERT INTO holds -> Hold H1 (expires_at = now() + 5m)
+    activate DB
+    DB-->>Alice: Hold H1 created
+    deactivate DB
+    Alice->>DB: UPDATE seats SET current_hold_id = 'H1' WHERE label = 'A7'
+    activate DB
+    DB-->>Alice: 1 row updated
+    deactivate DB
+    Alice->>DB: COMMIT Tx 1
+    activate DB
+    DB->>LockMgr: Release all locks held by Tx 1
+    activate LockMgr
+    LockMgr-->>DB: Locks released
+    deactivate LockMgr
+    DB-->>Alice: 201 Created (Hold H1 confirmed for Alice)
+    deactivate DB
+
+    Note over Bob, LockMgr: Tx 1 committed! LockMgr wakes up Tx 2
+    activate DB
+    Note over DB: EvalPlanQual (EPQ) Re-evaluation:<br/>PostgreSQL inspects the NEW committed version of Seat A7
+    DB->>DB: Re-read Seat A7: current_hold_id = H1 (status: active, expires_at > now())
+    DB->>DB: Check condition: NOT EXISTS (active hold)<br/>Condition FAILS!
+    DB-->>Bob: RAISE EXCEPTION 'seat conflict: [A7]' (SQLSTATE SR409)
+    deactivate DB
+    Bob->>DB: ROLLBACK Tx 2
+    Note over Bob: HTTP 409 Conflict returned immediately.<br/>Zero double allocations. Alice's seat remains secure!
+```
 
 ---
 
@@ -247,13 +368,117 @@ In systems engineering, the mathematical proof that deadlocks cannot occur is **
 
 SeatRush formalizes this in **ADR 0001** (`docs/adr/0001-seat-ownership-in-postgres.md`). Every transaction in the system—whether claiming seats, releasing holds, confirming bookings, expiring holds, or processing payments—must acquire row locks in this exact hierarchical sequence:
 
+```mermaid
+flowchart TD
+    subgraph Hierarchy["Strict Total Lock Acquisition Hierarchy (ADR 0001)"]
+        direction TB
+        L1["<b>Step 1: Screening</b><br/><code>FOR KEY SHARE</code><br/><i>Guarantees screening exists; permits concurrent ticket sales</i>"]
+        L2["<b>Step 2: Idempotency Record</b><br/><code>FOR UPDATE</code><br/><i>Acquires exclusive request lease & fencing token</i>"]
+        L3["<b>Step 3: Customer Identity</b><br/><code>FOR NO KEY UPDATE</code><br/><i>Serializes customer operations without blocking FK checks</i>"]
+        L4["<b>Step 4: Prior Hold Rows</b><br/><code>ORDER BY id ASC FOR NO KEY UPDATE</code><br/><i>Sorted deterministically by UUID to prevent reclaim deadlocks</i>"]
+        L5["<b>Step 5: Requested Seat Rows</b><br/><code>ORDER BY id ASC FOR NO KEY UPDATE</code><br/><i>Sorted deterministically by UUID; eliminates circular wait</i>"]
+        L6["<b>Step 6: Screening Event Cursor</b><br/><code>FOR UPDATE</code><br/><i>Serializes outbox event sequence ID allocation on commit</i>"]
+
+        L1 ==> L2 ==> L3 ==> L4 ==> L5 ==> L6
+    end
+
+    classDef keyShare fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0f172a;
+    classDef forUpdate fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#0f172a;
+    classDef noKeyUpdate fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#0f172a;
+
+    class L1 keyShare;
+    class L2,L6 forUpdate;
+    class L3,L4,L5 noKeyUpdate;
 ```
-1. screening             (FOR KEY SHARE, or FOR UPDATE during reset)
-   └──► 2. idempotency   (FOR KEY SHARE during lookup; FOR UPDATE during execution)
-         └──► 3. customer identity (FOR NO KEY UPDATE)
-               └──► 4. existing hold rows (ORDER BY id ASC FOR NO KEY UPDATE)
-                     └──► 5. seat rows (ORDER BY id ASC FOR NO KEY UPDATE)
-                           └──► 6. screening_event_cursors (FOR UPDATE)
+
+No database transaction is ever permitted to acquire an earlier lock after taking a later lock. The complete interaction protocol between the application tier and the PostgreSQL lock manager is visualized below:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    box #f1f5f9 "API & Worker Tier"
+        participant Client as API Request / Worker
+    end
+    box #ede9fe "PostgreSQL 18 Database Engine"
+        participant Engine as Query Executor
+        participant LockMgr as Row Lock Manager
+        participant WAL as WAL & Storage Engine
+    end
+
+    Note over Client, Engine: Strict Resource Hierarchy Execution (ADR 0001)
+
+    Client->>Engine: 1. SELECT id FROM screenings WHERE id = $1 FOR KEY SHARE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleKeyShareLock (screenings)
+    activate LockMgr
+    Note over LockMgr: KEY SHARE: Shared lock compatible with other concurrent checkouts;<br/>blocks screening deletion or administrative reset.
+    LockMgr-->>Engine: Lock Granted
+    deactivate LockMgr
+    Engine-->>Client: Screening verified & locked
+    deactivate Engine
+
+    Client->>Engine: 2. SELECT id FROM idempotency_records WHERE id = $2 FOR UPDATE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleExclusiveLock (idempotency_records)
+    activate LockMgr
+    Note over LockMgr: FOR UPDATE: Exclusive write lock. Holds the 30-second<br/>fencing lease to prevent duplicate request execution.
+    LockMgr-->>Engine: Lock Granted
+    deactivate LockMgr
+    Engine-->>Client: Idempotency lease secured
+    deactivate Engine
+
+    Client->>Engine: 3. SELECT id FROM identities WHERE id = $3 FOR NO KEY UPDATE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleNoKeyUpdateLock (identities)
+    activate LockMgr
+    Note over LockMgr: NO KEY UPDATE: Serializes mutations on customer identity<br/>while allowing foreign key checks (KEY SHARE) from other tables.
+    LockMgr-->>Engine: Lock Granted
+    deactivate LockMgr
+    Engine-->>Client: Customer identity locked
+    deactivate Engine
+
+    Client->>Engine: 4. SELECT id FROM holds WHERE id IN (...) ORDER BY id ASC FOR NO KEY UPDATE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleNoKeyUpdateLock (holds, sorted by UUID)
+    activate LockMgr
+    Note over LockMgr: NO KEY UPDATE (Sorted ASC): Locks prior holders in deterministic<br/>UUID order to prevent reclaim deadlocks between simultaneous buyers.
+    LockMgr-->>Engine: Locks Granted
+    deactivate LockMgr
+    Engine-->>Client: Prior holds locked
+    deactivate Engine
+
+    Client->>Engine: 5. SELECT id FROM seats WHERE id IN (...) ORDER BY id ASC FOR NO KEY UPDATE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleNoKeyUpdateLock (seats, sorted by UUID)
+    activate LockMgr
+    Note over LockMgr: NO KEY UPDATE (Sorted ASC): Locks requested seats deterministically.<br/>Eliminates reverse-order deadlocks: [A1,A2] vs [A2,A1] serialize safely!
+    LockMgr-->>Engine: Locks Granted
+    deactivate LockMgr
+    Engine-->>Client: Inventory seats locked
+    deactivate Engine
+
+    Client->>Engine: 6. SELECT screening_id FROM screening_event_cursors WHERE screening_id = $1 FOR UPDATE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleExclusiveLock (screening_event_cursors)
+    activate LockMgr
+    Note over LockMgr: FOR UPDATE: Final serialization step. Allocates strictly monotonic<br/>sequence IDs for transactional outbox events upon commit.
+    LockMgr-->>Engine: Lock Granted
+    deactivate LockMgr
+    Engine-->>Client: Sequence cursor locked
+    deactivate Engine
+
+    Client->>Engine: COMMIT TRANSACTION
+    activate Engine
+    Engine->>WAL: Write transaction commit record to WAL
+    activate WAL
+    WAL-->>Engine: Disk flush confirmed
+    deactivate WAL
+    Engine->>LockMgr: Release all row and relation locks simultaneously
+    activate LockMgr
+    LockMgr-->>Engine: All locks freed
+    deactivate LockMgr
+    Engine-->>Client: 200 OK / 201 Created
+    deactivate Engine
 ```
 
 No database transaction is ever permitted to acquire an earlier lock after taking a later lock.
@@ -412,6 +637,171 @@ In a distributed system, application-tier validation is insufficient. Code has b
 
 SeatRush implements **Defense-in-Depth**: the database schema itself renders invalid states structurally impossible.
 
+
+### Relational Schema & Entity Relationships
+
+The foundation of SeatRush's concurrency safety is its strict relational data model. Every entity, foreign key, and cardinality constraint is designed to prevent orphan states, double allocations, and unrecorded financial liabilities at the database kernel level:
+
+```mermaid
+erDiagram
+    SCREENING ||--o{ SEAT : "contains"
+    SCREENING ||--o{ HOLD : "scopes"
+    SCREENING ||--o{ BOOKING : "hosts"
+    SCREENING ||--o{ DOMAIN_EVENT : "emits"
+    SCREENING ||--o| SCREENING_EVENT_CURSOR : "synchronizes"
+    SCREENING ||--o{ IDEMPOTENCY_RECORD : "protects"
+
+    IDENTITY ||--o{ HOLD : "reserves"
+    IDENTITY ||--o{ BOOKING : "owns"
+    IDENTITY ||--o{ IDEMPOTENCY_RECORD : "keys"
+
+    HOLD ||--|{ HOLD_ITEM : "comprises"
+    HOLD ||--o| BOOKING : "finalizes_to"
+    HOLD ||--o{ PAYMENT_ATTEMPT : "bills"
+    SEAT ||--o{ HOLD_ITEM : "held_in"
+    SEAT |o--o| HOLD : "current_hold"
+
+    BOOKING ||--|{ BOOKED_SEAT : "tickets"
+    SEAT ||--o{ BOOKED_SEAT : "assigned_to"
+
+    PAYMENT_ATTEMPT ||--o{ PAYMENT_EVENT : "logs"
+    PAYMENT_ATTEMPT ||--o| REFUND_REQUIRED : "recovers"
+    PAYMENT_ATTEMPT ||--o| BOOKING : "settles"
+
+    SCREENING {
+        uuid id PK
+        string demo_key UK
+        string title
+        timestamptz starts_at
+        int duration_minutes
+        int seat_price_paise
+        timestamptz created_at
+    }
+
+    SEAT {
+        uuid id PK
+        uuid screening_id FK
+        string label
+        string row
+        int number
+        uuid current_hold_id FK
+    }
+
+    HOLD {
+        uuid id PK
+        uuid screening_id FK
+        uuid customer_id FK
+        string status
+        int seat_count
+        int amount_paise
+        timestamptz created_at
+        timestamptz expires_at
+    }
+
+    HOLD_ITEM {
+        uuid hold_id PK "FK to holds"
+        uuid seat_id PK "FK to seats"
+        uuid screening_id FK
+        int price_paise
+    }
+
+    BOOKING {
+        uuid id PK
+        string reference UK
+        uuid hold_id FK "Unique FK to holds"
+        uuid screening_id FK
+        uuid customer_id FK
+        uuid payment_attempt_id FK "Unique FK to payment_attempts"
+        int amount_paise
+        timestamptz confirmed_at
+    }
+
+    BOOKED_SEAT {
+        uuid id PK
+        uuid booking_id FK
+        uuid screening_id FK
+        uuid seat_id FK
+        string ticket_code UK
+        int price_paise
+    }
+
+    PAYMENT_ATTEMPT {
+        uuid id PK
+        uuid hold_id FK
+        string status
+        int amount_paise
+        string scenario
+        int delay_ms
+        timestamptz created_at
+        timestamptz finalized_at
+    }
+
+    PAYMENT_EVENT {
+        uuid id PK
+        string provider_event_id UK
+        uuid payment_attempt_id FK
+        string outcome
+        jsonb payload
+        string disposition
+        timestamptz received_at
+        timestamptz processed_at
+        boolean duplicate_event_emitted
+    }
+
+    REFUND_REQUIRED {
+        uuid id PK
+        uuid payment_attempt_id FK "Unique FK to payment_attempts"
+        int amount_paise
+        string reason
+        string status
+        timestamptz created_at
+        timestamptz refunded_at
+    }
+
+    DOMAIN_EVENT {
+        bigint id PK
+        uuid screening_id FK
+        uuid booking_id FK
+        uuid customer_id FK
+        string kind
+        jsonb payload
+        timestamptz created_at
+        timestamptz published_at
+    }
+
+    IDEMPOTENCY_RECORD {
+        uuid id PK
+        uuid customer_id FK
+        uuid screening_id FK
+        string operation
+        string key
+        string request_hash
+        string status
+        int response_code
+        jsonb response_body
+        timestamptz created_at
+        timestamptz locked_until
+        timestamptz retain_until
+    }
+
+    SCREENING_EVENT_CURSOR {
+        uuid screening_id PK "PK & FK to screenings"
+        bigint last_event_id
+    }
+
+    IDENTITY {
+        uuid id PK
+        string demo_key UK
+        string display_name
+        string role
+        timestamptz created_at
+    }
+```
+
+#### Concurrency Architectural Highlights in the Schema:
+1. **Referential Lock Independence:** Foreign key references from `hold_items` and `booked_seats` to `seats` take `KEY SHARE` locks on referenced rows during insertion. Claim transactions lock seats with `FOR NO KEY UPDATE` rather than `FOR UPDATE`, ensuring business mutations never deadlock against foreign key verifications.
+2. **Fast Ownership Pointers:** `seats.current_hold_id` provides $O(1)$ fast-path availability lookups, while deferred integrity trigger `assert_hold_integrity` guarantees 100% bidirectional consistency between `seats`, `holds`, and `hold_items` at transaction commit.
+3. **Fenced Financial Reconciliation:** `payment_attempts` transitions into an absorbing state, fanning out either to a completed `bookings` record or to an immutable `refund_required` record if the hold expires before webhook delivery (FR-05).
 ### The Immutable Hold Clock: `CHECK` + `BEFORE INSERT/UPDATE` Triggers
 
 Holds in SeatRush are strictly valid for **exactly 5 minutes**.
@@ -551,17 +941,36 @@ Distributed systems become uncontrollable when state transitions are bidirection
 
 ### The Hold Lifecycle & Self-Expiring Reads
 
-```
-                  ┌───────────────┐
-                  │    active     │
-                  └───────┬───────┘
-          ┌───────────────┼───────────────┐
-          │ (manual)      │ (auto/sweep)  │ (payment ok)
-          ▼               ▼               ▼
-    ┌───────────┐   ┌───────────┐   ┌───────────┐
-    │ released  │   │  expired  │   │ confirmed │
-    └───────────┘   └───────────┘   └───────────┘
-     [terminal]      [terminal]      [terminal]
+```mermaid
+stateDiagram-v2
+    [*] --> Active : claim_seats() [Atomic Pessimistic Lock]
+
+    state Active {
+        [*] --> UnexpiredClock : now() < expires_at
+        UnexpiredClock --> ApproachingExpiry : 5-minute countdown
+        ApproachingExpiry : Visual Countdown Ring
+        ApproachingExpiry : Non-extendable database clock
+    }
+
+    Active --> Released : release_hold() [Customer Manual Intent]
+    Active --> Expired : expires_at <= now() [Self-Expiring Read / Worker Sweep]
+    Active --> Confirmed : prepare_booking() [Full Payment Captured]
+
+    Released --> [*] : Seats Returned to Available Pool
+    Expired --> [*] : Seats Instantly Reclaimable by Next Customer
+    Confirmed --> [*] : BookedSeats Created & Tickets Issued
+
+    note right of Active
+        <b>Defensive Constraints:</b><br/>• CHECK (expires_at = created_at + 5min)<br/>• Trigger guard_hold_clock()<br/>• Exclusion: holds_one_active_customer<br/>• Deferred: assert_hold_integrity()
+    end note
+
+    note right of Confirmed
+        <b>Absorbing Business State:</b><br/>• Immutable outside demo reset<br/>• Clears seat current_hold_id<br/>• Emits booking.confirmed
+    end note
+
+    note right of Expired
+        <b>Zero-Dependency Availability:</b><br/>• Read queries evaluate expires_at <= now()<br/>• Reclaim is instant without worker delays
+    end note
 ```
 
 A hold begins in the `active` state. From `active`, it can transition to exactly one of three terminal states:
@@ -601,16 +1010,49 @@ Payment attempts simulate real-world card and webhook integrations across 6 real
 
 ![Payment Scenarios](screenshots/05-payment-scenarios.png)
 
-```
-                  ┌───────────────┐
-                  │   initiated   │
-                  └───────┬───────┘
-          ┌───────────────┴───────────────┐
-          ▼                               ▼
-    ┌───────────┐                   ┌───────────┐
-    │ succeeded │                   │  failed   │
-    └───────────┘                   └───────────┘
-     [absorbing]                     [absorbing]
+```mermaid
+stateDiagram-v2
+    [*] --> Initiated : POST /payments [Idempotent Request]
+
+    state "PaymentAttempt: initiated" as Initiated
+    state "PaymentAttempt: succeeded" as Succeeded
+    state "PaymentAttempt: failed" as Failed
+
+    Initiated --> Succeeded : Webhook / Notification (outcome = 'succeeded')
+    Initiated --> Failed : Webhook / Notification (outcome = 'failed')
+
+    Failed --> [*] : Terminal (Hold persists until 5m expiry or release)
+
+    state "Fork on Hold Liveness (FR-05)" as Fork <<choice>>
+    Succeeded --> Fork : Evaluate Hold State in Tx
+
+    state "Booking Confirmed" as ConfirmedBooking
+    state "Refund Required" as RefundReq
+    state "Refund Processing" as RefundProc
+    state "Refund Succeeded" as RefundDone
+
+    Fork --> ConfirmedBooking : Hold active AND owns seats
+    Fork --> RefundReq : Hold expired OR seats reclaimed
+
+    ConfirmedBooking --> [*] : Tickets Issued (No liability)
+
+    state "Two-Phase Refund Recovery Loop" as RefundRecovery {
+        RefundReq --> RefundProc : completeRefund() Phase 1 [Worker Lease]
+        RefundProc --> RefundDone : completeRefund() Phase 2 [Gateway Settlement]
+        RefundDone --> [*]
+    }
+
+    note right of Succeeded
+        <b>Absorbing Terminal State:</b><br/>• Trigger guard_payment_transition()<br/>• Record is permanently immutable
+    end note
+
+    note right of RefundReq
+        <b>FR-05 Automatic Protection:</b><br/>• Durable row in refund_required<br/>• Outbox event refund.required emitted<br/>• Bob's reclaimed seat untouched
+    end note
+
+    note right of RefundProc
+        <b>Crash-Resilient Settlement:</b><br/>• Status 'processing' committed first<br/>• Worker reboot recovers in-flight work
+    end note
 ```
 
 Payment attempts start as `initiated`. They can transition to `succeeded` or `failed`.
@@ -704,6 +1146,99 @@ return { disposition: 'applied', refundRequiredId: refund.id };
 - A durable row in `refund_required` is created in the exact same transaction.
 - An outbox event `refund.required` is committed.
 - Both customer invariants are completely preserved.
+
+#### Visualizing the Race Condition Timeline (FR-05)
+
+The sequence diagram below reveals how the database kernel serializes Alice's late payment and Bob's legitimate seat reclaim without data corruption:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    box #f1f5f9 "Customer Tier"
+        actor Alice as Customer Alice
+        actor Bob as Customer Bob
+    end
+    box #fef3c7 "API Gateway Tier"
+        participant API as SeatRush Express API
+    end
+    box #ede9fe "PostgreSQL 18 Kernel"
+        participant DB as PostgreSQL Engine (ACID)
+    end
+    box #fee2e2 "External Services & Workers"
+        participant Gate as Payment Simulator
+        participant Worker as BullMQ Background Worker
+    end
+
+    Note over Alice, DB: Timeline T0 (12:00:00) — Alice claims Seat A7
+    Alice->>API: POST /holds (Seat A7)
+    activate API
+    API->>DB: claim_seats(A7) -> Hold H1 (expires 12:05:00)
+    activate DB
+    DB-->>API: Hold H1 active
+    deactivate DB
+    API-->>Alice: 201 Created (Hold H1, 5-minute countdown begins)
+    deactivate API
+
+    Note over Alice, Gate: Timeline T1 (12:04:50) — Alice initiates payment (15s simulated delay)
+    Alice->>API: POST /payments (Hold H1, scenario: delayed_success)
+    activate API
+    API->>DB: INSERT INTO payment_attempts (Hold H1, status: 'initiated')
+    activate DB
+    DB-->>API: PaymentAttempt PA1 created
+    deactivate DB
+    API->>Gate: Dispatch payment job (simulating 15s external gateway processing)
+    API-->>Alice: 202 Accepted (Payment processing in background)
+    deactivate API
+
+    Note over DB: Timeline T2 (12:05:00) — Alice's hold officially expires by DB clock
+    Note over DB: expires_at <= now() on Hold H1.<br/>Seat A7 becomes self-expiring and instantly reclaimable!
+
+    Note over Bob, DB: Timeline T3 (12:05:01) — Bob claims Seat A7 before Alice's payment settles
+    Bob->>API: POST /holds (Seat A7)
+    activate API
+    API->>DB: claim_seats(A7)
+    activate DB
+    Note over DB: claim_seats evaluates Seat A7:<br/>H1 expires_at <= now() -> H1 is non-blocking!<br/>Seat A7 successfully transferred to Bob!
+    DB-->>API: Hold H2 active for Bob
+    deactivate DB
+    API-->>Bob: 201 Created (Hold H2 confirmed for Bob)
+    deactivate API
+
+    Note over Gate, DB: Timeline T4 (12:05:05) — Delayed payment webhook arrives for Alice
+    Gate->>API: POST /payments/notifications (PA1, outcome: 'succeeded')
+    activate API
+    API->>DB: BEGIN Transaction
+    activate DB
+    API->>DB: Strict lock acquisition: Screening -> Customer -> Hold H1 -> Seat A7
+    API->>DB: UPDATE payment_attempts SET status = 'succeeded' (Absorbing State!)
+    API->>DB: Inspect Hold H1: status='active', BUT expires_at <= now() AND Seat A7 owned by H2!
+
+    Note over DB: CRITICAL FORK (FR-05): SEAT ALREADY RECLAIMED BY BOB!<br/>PostgreSQL invariants forbid overwriting Bob's active hold!
+    API->>DB: INSERT INTO refund_required (payment_attempt_id, amount_paise, reason: 'hold_expired')
+    API->>DB: INSERT INTO domain_events (kind: 'refund.required')
+    API->>DB: COMMIT Transaction
+    DB-->>API: Transaction Committed (Disposition: applied, refundRequiredId: R1)
+    deactivate DB
+    API-->>Gate: 200 OK (Webhook handled successfully)
+    deactivate API
+
+    Note over Worker, DB: Timeline T5 (12:05:10) — Worker executes two-phase refund recovery loop
+    Worker->>DB: completeRefund(R1) — Phase 1: Lock & commit status = 'processing'
+    activate DB
+    DB-->>Worker: Phase 1 durable on disk
+    deactivate DB
+    Worker->>Gate: Settle external gateway refund for Alice (₹500.00)
+    activate Gate
+    Gate-->>Worker: Refund settlement confirmed
+    deactivate Gate
+    Worker->>DB: completeRefund(R1) — Phase 2: UPDATE refund_required SET status = 'refunded'
+    activate DB
+    Worker->>DB: INSERT INTO domain_events (kind: 'refund.completed')
+    DB-->>Worker: Phase 2 durable on disk
+    deactivate DB
+
+    Note over Alice, Bob: INVARIANTS 100% PRESERVED:<br/>• Alice receives a complete, automated refund.<br/>• Bob enjoys his movie in Seat A7 without interruption.
+```
 
 ### The Two-Phase Refund Recovery Loop
 
@@ -986,59 +1521,89 @@ Because of this savepoint isolation, if Customer A loses a seat race, the 409 Co
 
 ## 9. Visual System Architecture & Mermaid Diagrams
 
-### Entity State Machine Transitions
+### Hold & Payment Entity State Machines
+
+SeatRush separates inventory locks from financial settlement by modeling holds and payments as independent, cooperating state machines governed by database triggers:
+
+#### 1. Hold Lifecycle State Machine
 
 ```mermaid
 stateDiagram-v2
-    [*] --> HoldActive : claim_seats()
+    [*] --> Active : claim_seats() [Atomic Pessimistic Lock]
 
-    state "Hold: active" as HoldActive
-    state "Hold: released" as HoldReleased
-    state "Hold: expired" as HoldExpired
-    state "Hold: confirmed" as HoldConfirmed
+    state Active {
+        [*] --> UnexpiredClock : now() < expires_at
+        UnexpiredClock --> ApproachingExpiry : 5-minute countdown
+        ApproachingExpiry : Visual Countdown Ring
+        ApproachingExpiry : Non-extendable database clock
+    }
 
-    HoldActive --> HoldReleased : release_hold() [Customer Action]
-    HoldActive --> HoldExpired : expires_at <= now() [Background / Self-Expiring]
-    HoldActive --> HoldConfirmed : prepare_booking() [Full Payment Validated]
+    Active --> Released : release_hold() [Customer Manual Intent]
+    Active --> Expired : expires_at <= now() [Self-Expiring Read / Worker Sweep]
+    Active --> Confirmed : prepare_booking() [Full Payment Captured]
 
-    HoldReleased --> [*]
-    HoldExpired --> [*]
-    HoldConfirmed --> [*]
+    Released --> [*] : Seats Returned to Available Pool
+    Expired --> [*] : Seats Instantly Reclaimable by Next Customer
+    Confirmed --> [*] : BookedSeats Created & Tickets Issued
 
-    note right of HoldActive
-        CHECK (expires_at = created_at + 5min)
-        EXCLUDE USING gist (customer_id, screening_id, range)
+    note right of Active
+        <b>Defensive Constraints:</b><br/>• CHECK (expires_at = created_at + 5min)<br/>• Trigger guard_hold_clock()<br/>• Exclusion: holds_one_active_customer<br/>• Deferred: assert_hold_integrity()
     end note
 
-    note right of HoldConfirmed
-        Immutable outside reset_demo_screening()
-        Emits domain_event: booking.confirmed
+    note right of Confirmed
+        <b>Absorbing Business State:</b><br/>• Immutable outside demo reset<br/>• Clears seat current_hold_id<br/>• Emits booking.confirmed
     end note
 
-    state "Payment: initiated" as PayInitiated
-    state "Payment: succeeded" as PaySucceeded
-    state "Payment: failed" as PayFailed
+    note right of Expired
+        <b>Zero-Dependency Availability:</b><br/>• Read queries evaluate expires_at <= now()<br/>• Reclaim is instant without worker delays
+    end note
+```
 
-    [*] --> PayInitiated : startPayment()
-    PayInitiated --> PaySucceeded : webhook outcome = 'succeeded'
-    PayInitiated --> PayFailed : webhook outcome = 'failed'
+#### 2. PaymentAttempt & Refund Recovery State Machine
 
-    PaySucceeded --> [*]
-    PayFailed --> [*]
+```mermaid
+stateDiagram-v2
+    [*] --> Initiated : POST /payments [Idempotent Request]
 
-    note right of PaySucceeded
-        Absorbing terminal state
-        Guarded by guard_payment_transition()
+    state "PaymentAttempt: initiated" as Initiated
+    state "PaymentAttempt: succeeded" as Succeeded
+    state "PaymentAttempt: failed" as Failed
+
+    Initiated --> Succeeded : Webhook / Notification (outcome = 'succeeded')
+    Initiated --> Failed : Webhook / Notification (outcome = 'failed')
+
+    Failed --> [*] : Terminal (Hold persists until 5m expiry or release)
+
+    state "Fork on Hold Liveness (FR-05)" as Fork <<choice>>
+    Succeeded --> Fork : Evaluate Hold State in Tx
+
+    state "Booking Confirmed" as ConfirmedBooking
+    state "Refund Required" as RefundReq
+    state "Refund Processing" as RefundProc
+    state "Refund Succeeded" as RefundDone
+
+    Fork --> ConfirmedBooking : Hold active AND owns seats
+    Fork --> RefundReq : Hold expired OR seats reclaimed
+
+    ConfirmedBooking --> [*] : Tickets Issued (No liability)
+
+    state "Two-Phase Refund Recovery Loop" as RefundRecovery {
+        RefundReq --> RefundProc : completeRefund() Phase 1 [Worker Lease]
+        RefundProc --> RefundDone : completeRefund() Phase 2 [Gateway Settlement]
+        RefundDone --> [*]
+    }
+
+    note right of Succeeded
+        <b>Absorbing Terminal State:</b><br/>• Trigger guard_payment_transition()<br/>• Record is permanently immutable
     end note
 
-    state "Refund: required" as RefRequired
-    state "Refund: processing" as RefProcessing
-    state "Refund: refunded" as RefRefunded
+    note right of RefundReq
+        <b>FR-05 Automatic Protection:</b><br/>• Durable row in refund_required<br/>• Outbox event refund.required emitted<br/>• Bob's reclaimed seat untouched
+    end note
 
-    PaySucceeded --> RefRequired : Hold expired/released before webhook
-    RefRequired --> RefProcessing : completeRefund() Phase 1
-    RefProcessing --> RefRefunded : completeRefund() Phase 2
-    RefRefunded --> [*]
+    note right of RefundProc
+        <b>Crash-Resilient Settlement:</b><br/>• Status 'processing' committed first<br/>• Worker reboot recovers in-flight work
+    end note
 ```
 
 ---
@@ -1048,31 +1613,89 @@ stateDiagram-v2
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Client as API Request / Worker
-    participant DB as PostgreSQL Transaction
+    box #f1f5f9 "API & Worker Tier"
+        participant Client as API Request / Worker
+    end
+    box #ede9fe "PostgreSQL 18 Database Engine"
+        participant Engine as Query Executor
+        participant LockMgr as Row Lock Manager
+        participant WAL as WAL & Storage Engine
+    end
 
-    Note over Client, DB: Strict Total Hierarchy (ADR 0001)
+    Note over Client, Engine: Strict Resource Hierarchy Execution (ADR 0001)
 
-    Client->>DB: 1. SELECT id FROM screenings WHERE id = ... FOR KEY SHARE
-    Note over DB: Shared lock on parent screening
+    Client->>Engine: 1. SELECT id FROM screenings WHERE id = $1 FOR KEY SHARE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleKeyShareLock (screenings)
+    activate LockMgr
+    Note over LockMgr: KEY SHARE: Shared lock compatible with other concurrent checkouts;<br/>blocks screening deletion or administrative reset.
+    LockMgr-->>Engine: Lock Granted
+    deactivate LockMgr
+    Engine-->>Client: Screening verified & locked
+    deactivate Engine
 
-    Client->>DB: 2. SELECT id FROM idempotency_records WHERE id = ... FOR UPDATE
-    Note over DB: Exclusive lock on idempotency lease / fencing token
+    Client->>Engine: 2. SELECT id FROM idempotency_records WHERE id = $2 FOR UPDATE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleExclusiveLock (idempotency_records)
+    activate LockMgr
+    Note over LockMgr: FOR UPDATE: Exclusive write lock. Holds the 30-second<br/>fencing lease to prevent duplicate request execution.
+    LockMgr-->>Engine: Lock Granted
+    deactivate LockMgr
+    Engine-->>Client: Idempotency lease secured
+    deactivate Engine
 
-    Client->>DB: 3. SELECT id FROM identities WHERE id = ... FOR NO KEY UPDATE
-    Note over DB: Serializes customer identity without blocking key shares
+    Client->>Engine: 3. SELECT id FROM identities WHERE id = $3 FOR NO KEY UPDATE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleNoKeyUpdateLock (identities)
+    activate LockMgr
+    Note over LockMgr: NO KEY UPDATE: Serializes mutations on customer identity<br/>while allowing foreign key checks (KEY SHARE) from other tables.
+    LockMgr-->>Engine: Lock Granted
+    deactivate LockMgr
+    Engine-->>Client: Customer identity locked
+    deactivate Engine
 
-    Client->>DB: 4. SELECT id FROM holds WHERE id IN (...) ORDER BY id ASC FOR NO KEY UPDATE
-    Note over DB: Locks prior owners in deterministic ascending UUID order
+    Client->>Engine: 4. SELECT id FROM holds WHERE id IN (...) ORDER BY id ASC FOR NO KEY UPDATE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleNoKeyUpdateLock (holds, sorted by UUID)
+    activate LockMgr
+    Note over LockMgr: NO KEY UPDATE (Sorted ASC): Locks prior holders in deterministic<br/>UUID order to prevent reclaim deadlocks between simultaneous buyers.
+    LockMgr-->>Engine: Locks Granted
+    deactivate LockMgr
+    Engine-->>Client: Prior holds locked
+    deactivate Engine
 
-    Client->>DB: 5. SELECT id FROM seats WHERE id IN (...) ORDER BY id ASC FOR NO KEY UPDATE
-    Note over DB: Locks requested seats in deterministic ascending UUID order
+    Client->>Engine: 5. SELECT id FROM seats WHERE id IN (...) ORDER BY id ASC FOR NO KEY UPDATE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleNoKeyUpdateLock (seats, sorted by UUID)
+    activate LockMgr
+    Note over LockMgr: NO KEY UPDATE (Sorted ASC): Locks requested seats deterministically.<br/>Eliminates reverse-order deadlocks: [A1,A2] vs [A2,A1] serialize safely!
+    LockMgr-->>Engine: Locks Granted
+    deactivate LockMgr
+    Engine-->>Client: Inventory seats locked
+    deactivate Engine
 
-    Client->>DB: 6. SELECT screening_id FROM screening_event_cursors WHERE ... FOR UPDATE
-    Note over DB: Final serialization lock: allocates monotonic sequence ID
+    Client->>Engine: 6. SELECT screening_id FROM screening_event_cursors WHERE screening_id = $1 FOR UPDATE
+    activate Engine
+    Engine->>LockMgr: Acquire TupleExclusiveLock (screening_event_cursors)
+    activate LockMgr
+    Note over LockMgr: FOR UPDATE: Final serialization step. Allocates strictly monotonic<br/>sequence IDs for transactional outbox events upon commit.
+    LockMgr-->>Engine: Lock Granted
+    deactivate LockMgr
+    Engine-->>Client: Sequence cursor locked
+    deactivate Engine
 
-    Client->>DB: COMMIT
-    Note over DB: All locks released simultaneously at commit
+    Client->>Engine: COMMIT TRANSACTION
+    activate Engine
+    Engine->>WAL: Write transaction commit record to WAL
+    activate WAL
+    WAL-->>Engine: Disk flush confirmed
+    deactivate WAL
+    Engine->>LockMgr: Release all row and relation locks simultaneously
+    activate LockMgr
+    LockMgr-->>Engine: All locks freed
+    deactivate LockMgr
+    Engine-->>Client: 200 OK / 201 Created
+    deactivate Engine
 ```
 
 ---
@@ -1082,50 +1705,90 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Alice as Customer Alice
-    actor Bob as Customer Bob
-    participant API as SeatRush API
-    participant PG as PostgreSQL Engine
-    participant Gate as Payment Simulator
-    participant Worker as BullMQ Worker
+    box #f1f5f9 "Customer Tier"
+        actor Alice as Customer Alice
+        actor Bob as Customer Bob
+    end
+    box #fef3c7 "API Gateway Tier"
+        participant API as SeatRush Express API
+    end
+    box #ede9fe "PostgreSQL 18 Kernel"
+        participant DB as PostgreSQL Engine (ACID)
+    end
+    box #fee2e2 "External Services & Workers"
+        participant Gate as Payment Simulator
+        participant Worker as BullMQ Background Worker
+    end
 
-    Note over Alice, PG: T0 (12:00:00): Alice claims Seat A7 (5-minute hold)
+    Note over Alice, DB: Timeline T0 (12:00:00) — Alice claims Seat A7
     Alice->>API: POST /holds (Seat A7)
-    API->>PG: claim_seats(A7) -> Hold H1 (expires 12:05:00)
-    PG-->>API: Hold H1 active
+    activate API
+    API->>DB: claim_seats(A7) -> Hold H1 (expires 12:05:00)
+    activate DB
+    DB-->>API: Hold H1 active
+    deactivate DB
+    API-->>Alice: 201 Created (Hold H1, 5-minute countdown begins)
+    deactivate API
 
-    Note over Alice, Gate: T1 (12:04:50): Alice initiates payment (15s simulated delay)
+    Note over Alice, Gate: Timeline T1 (12:04:50) — Alice initiates payment (15s simulated delay)
     Alice->>API: POST /payments (Hold H1, scenario: delayed_success)
-    API->>PG: INSERT INTO payment_attempts (status: initiated)
-    API->>Gate: Dispatch payment job
+    activate API
+    API->>DB: INSERT INTO payment_attempts (Hold H1, status: 'initiated')
+    activate DB
+    DB-->>API: PaymentAttempt PA1 created
+    deactivate DB
+    API->>Gate: Dispatch payment job (simulating 15s external gateway processing)
+    API-->>Alice: 202 Accepted (Payment processing in background)
+    deactivate API
 
-    Note over PG: T2 (12:05:00): Hold H1 expires by DB clock (expires_at <= now())
+    Note over DB: Timeline T2 (12:05:00) — Alice's hold officially expires by DB clock
+    Note over DB: expires_at <= now() on Hold H1.<br/>Seat A7 becomes self-expiring and instantly reclaimable!
 
-    Note over Bob, PG: T3 (12:05:01): Bob attempts to claim Seat A7
+    Note over Bob, DB: Timeline T3 (12:05:01) — Bob claims Seat A7 before Alice's payment settles
     Bob->>API: POST /holds (Seat A7)
-    API->>PG: claim_seats(A7)
-    Note over PG: claim_seats checks: H1 expires_at <= now()<br/>H1 is non-blocking! A7 claimed for Bob!
-    PG-->>API: Hold H2 active for Bob!
-    API-->>Bob: 201 Created (Hold H2)
+    activate API
+    API->>DB: claim_seats(A7)
+    activate DB
+    Note over DB: claim_seats evaluates Seat A7:<br/>H1 expires_at <= now() -> H1 is non-blocking!<br/>Seat A7 successfully transferred to Bob!
+    DB-->>API: Hold H2 active for Bob
+    deactivate DB
+    API-->>Bob: 201 Created (Hold H2 confirmed for Bob)
+    deactivate API
 
-    Note over Gate, PG: T4 (12:05:05): Gateway webhook arrives with 'succeeded' for Alice!
-    Gate->>API: POST /payments/notifications (attemptId, outcome: 'succeeded')
-    API->>PG: BEGIN Transaction
-    API->>PG: Lock Screening -> Customer -> Hold H1 -> Seat A7 (Strict Order)
-    API->>PG: UPDATE payment_attempts SET status = 'succeeded'
-    API->>PG: Inspect Hold H1: status='active', but expires_at <= now() AND Seat A7 owned by H2!
-    
-    Note over PG: SEAT ALREADY RECLAIMED! DO NOT OVERWRITE BOB!
-    API->>PG: INSERT INTO refund_required (amount, reason: 'hold_expired')
-    API->>PG: INSERT INTO domain_events (kind: 'refund.required')
-    API->>PG: COMMIT
-    API-->>Gate: 200 OK (Disposition: applied, refundRequiredId: R1)
+    Note over Gate, DB: Timeline T4 (12:05:05) — Delayed payment webhook arrives for Alice
+    Gate->>API: POST /payments/notifications (PA1, outcome: 'succeeded')
+    activate API
+    API->>DB: BEGIN Transaction
+    activate DB
+    API->>DB: Strict lock acquisition: Screening -> Customer -> Hold H1 -> Seat A7
+    API->>DB: UPDATE payment_attempts SET status = 'succeeded' (Absorbing State!)
+    API->>DB: Inspect Hold H1: status='active', BUT expires_at <= now() AND Seat A7 owned by H2!
 
-    Note over Worker, PG: T5: Worker sweeps pending refunds
-    Worker->>PG: completeRefund(R1)
-    PG->>PG: UPDATE refund_required SET status = 'refunded'
-    PG->>PG: INSERT INTO domain_events (kind: 'refund.completed')
-    Note over Worker: Alice receives 100% refund; Bob safely watches movie!
+    Note over DB: CRITICAL FORK (FR-05): SEAT ALREADY RECLAIMED BY BOB!<br/>PostgreSQL invariants forbid overwriting Bob's active hold!
+    API->>DB: INSERT INTO refund_required (payment_attempt_id, amount_paise, reason: 'hold_expired')
+    API->>DB: INSERT INTO domain_events (kind: 'refund.required')
+    API->>DB: COMMIT Transaction
+    DB-->>API: Transaction Committed (Disposition: applied, refundRequiredId: R1)
+    deactivate DB
+    API-->>Gate: 200 OK (Webhook handled successfully)
+    deactivate API
+
+    Note over Worker, DB: Timeline T5 (12:05:10) — Worker executes two-phase refund recovery loop
+    Worker->>DB: completeRefund(R1) — Phase 1: Lock & commit status = 'processing'
+    activate DB
+    DB-->>Worker: Phase 1 durable on disk
+    deactivate DB
+    Worker->>Gate: Settle external gateway refund for Alice (₹500.00)
+    activate Gate
+    Gate-->>Worker: Refund settlement confirmed
+    deactivate Gate
+    Worker->>DB: completeRefund(R1) — Phase 2: UPDATE refund_required SET status = 'refunded'
+    activate DB
+    Worker->>DB: INSERT INTO domain_events (kind: 'refund.completed')
+    DB-->>Worker: Phase 2 durable on disk
+    deactivate DB
+
+    Note over Alice, Bob: INVARIANTS 100% PRESERVED:<br/>• Alice receives a complete, automated refund.<br/>• Bob enjoys his movie in Seat A7 without interruption.
 ```
 
 ---

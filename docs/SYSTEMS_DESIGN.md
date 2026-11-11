@@ -44,24 +44,38 @@ SeatRush moves the entire decision into the database kernel using **deterministi
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Alice as Customer 1
-    actor Bob as Customer 2
-    participant PG as PostgreSQL 18 Kernel
-    participant Inv as Seats Table (Row A7)
+    box rgba(240, 249, 255, 0.8) "Concurrent Clients"
+        actor Alice as Customer 1 (Alice)
+        actor Bob as Customer 2 (Bob)
+    end
+    box rgba(243, 232, 255, 0.8) "PostgreSQL 18 Kernel (Read Committed)"
+        participant Engine as Transaction Engine
+        participant Row as Seat Row A7 (Inventory)
+    end
 
-    Alice->>PG: BEGIN TRANSACTION
-    Bob->>PG: BEGIN TRANSACTION
-    Alice->>Inv: SELECT FOR NO KEY UPDATE (Row A7)
-    Note over Inv: Lock granted to Alice (xid 101)
-    Bob->>Inv: SELECT FOR NO KEY UPDATE (Row A7)
-    Note over Bob,Inv: Bob BLOCKS awaiting Alice's lock
-    Alice->>Inv: UPDATE seats SET current_hold_id = Alice WHERE expires_at <= now()
-    Alice->>PG: COMMIT
-    Note over Inv: Lock released. Bob wakes up!
-    Note over Bob,Inv: MVCC re-evaluates: A7 now held by Alice
-    Inv-->>Bob: UPDATE matches 0 rows!
-    Note over Bob: Raise SQLSTATE 'SR409' (Seat Conflict)
-    Bob->>PG: ROLLBACK
+    Alice->>Engine: BEGIN TRANSACTION (xid 101)
+    Bob->>Engine: BEGIN TRANSACTION (xid 102)
+    activate Alice
+    activate Bob
+
+    Alice->>Row: SELECT id FROM seats WHERE id = 'A7'<br/>FOR NO KEY UPDATE
+    activate Row
+    Note over Row: Row lock granted to Alice (xid 101)
+
+    Bob->>Row: SELECT id FROM seats WHERE id = 'A7'<br/>FOR NO KEY UPDATE
+    Note over Bob,Row: Bob BLOCKS on row lock (held by xid 101)
+
+    Alice->>Row: UPDATE seats SET current_hold_id = Alice_Hold<br/>WHERE expires_at <= now()
+    Alice->>Engine: COMMIT
+    deactivate Alice
+    Note over Row: Alice commits. Lock released!
+
+    Note over Bob,Row: PostgreSQL EvalPlanQual (EPQ) re-evaluates Row A7 for Bob.<br/>Row now has current_hold_id != NULL and unexpired!
+    Row-->>Bob: UPDATE matches 0 rows!
+    deactivate Row
+    Note over Bob: Stored procedure raises exception:<br/>SQLSTATE 'SR409' (seat_unavailable)
+    Bob->>Engine: ROLLBACK
+    deactivate Bob
 ```
 
 ---
@@ -71,19 +85,27 @@ sequenceDiagram
 These rules are not suggestions; they are enforced at compile time, in schema DDL, and via database triggers. If code violates these rules, the database rolls back the transaction.
 
 ```mermaid
-graph TD
-    subgraph "Core Invariants"
-        I1["1. PostgreSQL is Sole Authority<br/>(Redis/Queues never decide ownership)"]
-        I2["2. DB Clock is the Single Truth<br/>(Server/client clocks ignored for expiry)"]
-        I3["3. Strict Total Lock Hierarchy<br/>(Screening -> Idempotency -> Customer -> Holds -> Seats -> Cursor)"]
-        I4["4. All-or-Nothing Atomicity<br/>(1-4 seats reserved together or none reserved)"]
-        I5["5. Absorbing Payment State Machine<br/>(initiated -> succeeded | failed is one-way)"]
-        I6["6. Transactional Outbox<br/>(Business mutations & domain events commit together)"]
-        I7["7. Fenced Idempotency with Leases<br/>(SHA-256 canonical hashing + locked_until)"]
+flowchart TD
+    classDef auth fill:#e0e7ff,stroke:#4338ca,stroke-width:2px,color:#1e1b4b
+    classDef time fill:#fef3c7,stroke:#b45309,stroke-width:2px,color:#78350f
+    classDef lock fill:#fee2e2,stroke:#b91c1c,stroke-width:2px,color:#7f1d1d
+    classDef atom fill:#f3e8ff,stroke:#7e22ce,stroke-width:2px,color:#581c87
+    classDef state fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#14532d
+    classDef outbox fill:#fce7f3,stroke:#be185d,stroke-width:2px,color:#831843
+    classDef idem fill:#e0f2fe,stroke:#0369a1,stroke-width:2px,color:#0c4a6e
+
+    subgraph Invariants ["The 7 Non-Negotiable Invariants of SeatRush"]
+        direction TB
+        I1["1. PostgreSQL is Sole Authority<br/>Redis & queues never decide ownership"]:::auth
+        I2["2. Database Clock Decides Expiry<br/>now() evaluated in deciding transaction"]:::time
+        I3["3. Strict Total Lock Hierarchy<br/>Screening -> Idemp -> Customer -> Holds -> Seats -> Cursor"]:::lock
+        I4["4. All-or-Nothing Atomicity<br/>1-4 seats claimed together or 0 claimed"]:::atom
+        I5["5. Absorbing Payment State Machine<br/>initiated -> succeeded | failed is immutable"]:::state
+        I6["6. Transactional Outbox Pattern<br/>Data changes & domain events commit together"]:::outbox
+        I7["7. Fenced Idempotency with Leases<br/>SHA-256 canonical hashing + locked_until"]:::idem
     end
-    style I1 fill:#1f1229,stroke:#d6335f,color:#fff
-    style I3 fill:#1f1229,stroke:#ffb938,color:#fff
-    style I5 fill:#1f1229,stroke:#7d8af0,color:#fff
+
+    I1 --> I2 --> I3 --> I4 --> I5 --> I6 --> I7
 ```
 
 1. **PostgreSQL is the Sole Authority**: Redis and BullMQ queues are transient messengers. If Redis is flushed mid-simulation, not a single seat assignment or payment state is corrupted.
@@ -100,45 +122,161 @@ graph TD
 
 ```mermaid
 flowchart TB
-    subgraph Browser ["Client Surface"]
-        direction TB
-        UI["Next.js 16 App Router<br/>(Port 3000)"]
+    classDef clientTier fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0f172a
+    classDef apiTier fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#0f172a
+    classDef dbTier fill:#f3e8ff,stroke:#9333ea,stroke-width:2px,color:#0f172a
+    classDef queueTier fill:#ffe4e6,stroke:#e11d48,stroke-width:2px,color:#0f172a
+    classDef workerTier fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#0f172a
+
+    subgraph Client ["Client Browser Tier"]
+        UI["Next.js 16 Web UI<br/>(Port 3000)<br/>Accessible DOM & State Sync"]:::clientTier
     end
 
-    subgraph API_Layer ["API & Ingestion Surface"]
-        API["Express 5 REST API<br/>(Port 4000)"]
-        AUTH["HMAC-SHA256 Token Validator"]
-        IDEM["Idempotency Engine & Request Hasher"]
-        CONF["100ms Conflict Aggregator"]
+    subgraph API ["API Coordinator Tier (Express 5 - Port 4000)"]
+        AUTH["HMAC-SHA256 Auth<br/>(10 sessions/min/IP)"]:::apiTier
+        IDEM["Idempotency Fencing<br/>(30s Leases & Request Hash)"]:::apiTier
+        SVC["Booking & Payment Routes<br/>(Atomic Transactions)"]:::apiTier
+        CONF["Conflict Aggregator<br/>(100ms Bucketing)"]:::apiTier
     end
 
-    subgraph Persistence ["Authoritative State Engine"]
-        PG[("PostgreSQL 18<br/>(Host Port 5433)")]
-        subgraph Tables ["Database Core"]
-            SEATS["seats (Current Owner)"]
-            HOLDS["holds (5-min Leases)"]
-            BOOKINGS["bookings & booked_seats"]
-            PAYMENTS["payment_attempts & events"]
-            OUTBOX["domain_events & cursors"]
-            IDEM_TAB["idempotency_records"]
-        end
+    subgraph DB ["Authoritative Storage Engine (PostgreSQL 18 - Port 5433)"]
+        PG_SEATS[("seats & hold_items<br/>(FOR NO KEY UPDATE)")]:::dbTier
+        PG_HOLDS[("holds<br/>(GiST Exclusion Window)")]:::dbTier
+        PG_BOOKINGS[("bookings & booked_seats<br/>(Unique Ticket Codes)")]:::dbTier
+        PG_PAY[("payment_attempts & events<br/>(Absorbing State Guards)")]:::dbTier
+        PG_OUTBOX[("domain_events<br/>& screening_event_cursors")]:::dbTier
+        PG_IDEM[("idempotency_records<br/>(Scoped Fencing Tokens)")]:::dbTier
     end
 
-    subgraph Messaging ["Background Workers & Queues"]
-        REDIS[("Redis 8<br/>(Host Port 6379)")]
-        WORKER["BullMQ Worker Daemon"]
-        SWEEPS["30s Reconciliation Loops"]
+    subgraph Async ["Async Messaging Tier (Redis 8 - Port 6379)"]
+        QUEUES["BullMQ Queues<br/>hold-expiry (delay 5m)<br/>payment-events (c:32)<br/>refunds (c:8)"]:::queueTier
+        PUBSUB["Pub/Sub Channel<br/>seatrush:conflicts"]:::queueTier
     end
 
-    UI -->|REST + Bearer Token| API
-    API --> AUTH --> IDEM
-    IDEM -->|SELECT ... FOR NO KEY UPDATE| PG
-    API -->|Enqueue Delayed Jobs| REDIS
-    API -.->|Pub/Sub Conflict Windows| REDIS
-    REDIS -->|Consume Jobs| WORKER
-    WORKER -->|cleanup_expired_hold()| PG
-    WORKER -->|completeRefund()| PG
-    SWEEPS -.->|Heal Lost Redis Jobs| PG
+    subgraph Daemon ["Worker Daemon Tier"]
+        WORKER["BullMQ Processors<br/>* Expiry Cleanup<br/>* Payment Simulator (6 Scenarios)<br/>* 2-Phase Refunds"]:::workerTier
+        SWEEPS["30s Reconciliation Loops<br/>* Stalled Payments Recovery<br/>* Expired Holds Sweep"]:::workerTier
+    end
+
+    UI -->|1. REST Request + Bearer Token| AUTH
+    AUTH --> IDEM
+    IDEM -->|Verify Fencing Lease| PG_IDEM
+    IDEM --> SVC
+
+    SVC -->|claim_seats()| PG_SEATS
+    SVC -->|Insert 5m Hold| PG_HOLDS
+    SVC -->|Enqueue Delayed Expiry| QUEUES
+    SVC -.->|Publish Conflict Windows| PUBSUB
+    SVC -->|Commit Events Atomically| PG_OUTBOX
+
+    QUEUES --> WORKER
+    WORKER -->|POST /payments/notifications<br/>(HMAC-SHA256 Signed)| SVC
+    WORKER -->|cleanup_expired_hold()| PG_SEATS
+    WORKER -->|completeRefund()| PG_PAY
+    SWEEPS -.->|Heal Lost Redis Jobs| PG_HOLDS
+    SWEEPS -.->|Heal Stalled Payments| PG_PAY
+```
+
+### Complete Database Entity-Relationship Diagram (ERD)
+
+The following ERD models the schema relationships, constraints, and audit tables:
+
+```mermaid
+erDiagram
+    SCREENING ||--|{ SEAT : contains
+    SCREENING ||--o{ HOLD : schedules
+    SCREENING ||--o{ BOOKING : confirms
+    SCREENING ||--o{ DOMAIN_EVENT : tracks
+    SCREENING ||--|| SCREENING_EVENT_CURSOR : serializes
+
+    IDENTITY ||--o{ HOLD : reserves
+    IDENTITY ||--o{ BOOKING : owns
+    IDENTITY ||--o{ IDEMPOTENCY_RECORD : scopes
+
+    HOLD ||--|{ HOLD_ITEM : includes
+    HOLD ||--o| BOOKING : fulfills
+    HOLD ||--o{ PAYMENT_ATTEMPT : funds
+    SEAT ||--o| HOLD : "currently held by"
+
+    BOOKING ||--|{ BOOKED_SEAT : issues
+    BOOKING ||--|| PAYMENT_ATTEMPT : "settled by"
+    SEAT ||--o| BOOKED_SEAT : "permanently sold as"
+
+    PAYMENT_ATTEMPT ||--o{ PAYMENT_EVENT : records
+    PAYMENT_ATTEMPT ||--o| REFUND_REQUIRED : "triggers if late"
+
+    SCREENING {
+        uuid id PK
+        string demo_key UK
+        string title
+        timestamptz starts_at
+        int seat_price_paise
+    }
+
+    SEAT {
+        uuid id PK
+        uuid screening_id FK
+        string label "e.g. A7"
+        string row
+        int number
+        uuid current_hold_id FK "nullable"
+    }
+
+    HOLD {
+        uuid id PK
+        uuid screening_id FK
+        uuid customer_id FK
+        string status "active|expired|released|confirmed"
+        int seat_count "1-4"
+        int amount_paise
+        timestamptz created_at
+        timestamptz expires_at "created_at + 5min"
+    }
+
+    PAYMENT_ATTEMPT {
+        uuid id PK
+        uuid hold_id FK
+        string status "initiated|succeeded|failed"
+        int amount_paise
+        timestamptz created_at
+        timestamptz finalized_at
+    }
+
+    BOOKING {
+        uuid id PK
+        string reference UK "SR-XXXX"
+        uuid hold_id UK,FK
+        uuid payment_attempt_id UK,FK
+        int amount_paise
+        timestamptz confirmed_at
+    }
+
+    REFUND_REQUIRED {
+        uuid id PK
+        uuid payment_attempt_id UK,FK
+        int amount_paise
+        string reason "hold_expired|hold_released"
+        string status "required|processing|refunded"
+    }
+
+    DOMAIN_EVENT {
+        bigserial id PK
+        uuid screening_id FK
+        string kind "hold.created, booking.confirmed..."
+        jsonb payload "Strict event data"
+        timestamptz created_at
+    }
+
+    IDEMPOTENCY_RECORD {
+        uuid id PK
+        uuid customer_id FK
+        string operation "POST /holds, etc."
+        string key "Client UUID"
+        string request_hash "SHA-256"
+        string status "in_progress|completed"
+        timestamptz locked_until "30s Lease"
+        timestamptz retain_until "24h TTL"
+    }
 ```
 
 ### Clean Architecture Seams
