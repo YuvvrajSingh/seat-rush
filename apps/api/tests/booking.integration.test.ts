@@ -12,13 +12,15 @@ import { createHoldInTransaction } from "../src/booking.js";
 import { Redis } from "ioredis";
 import { createConflictChannel } from "../src/conflicts.js";
 
+import { signPaymentNotification } from "@seatrush/shared/server";
 const url = process.env.TEST_DATABASE_URL;
 if (!url || url === process.env.DATABASE_URL) throw new Error("A separate TEST_DATABASE_URL is required");
 const prisma = createPrismaClient(url, { max: 20 });
 const secret = "integration-test-auth-secret-at-least-32-characters";
+const webhookSecret = "distinct-integration-webhook-secret-at-least-32-characters";
 const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379", { maxRetriesPerRequest: 1 });
 const conflicts = createConflictChannel({ prisma, publisher: redis, logger: pino({ level: "silent" }) });
-const app = createApp({ prisma, conflicts, authTokenSecret: secret, logger: pino({ level: "silent" }),
+const app = createApp({ prisma, conflicts, authTokenSecret: secret, paymentWebhookSecret: webhookSecret, logger: pino({ level: "silent" }),
   webOrigin: "http://localhost:3000", readinessChecks: { postgres: async () => {}, redis: async () => {} } });
 let screeningId: string;
 let customers: string[];
@@ -45,6 +47,7 @@ afterEach(async () => {
     const matching = events.filter((event) => SeatEventSchema.parse(event.payload).holdId === hold.id);
     expect(matching).toHaveLength(1);
     const event = SeatEventSchema.parse(matching[0]!.payload);
+    if (!("seats" in event)) throw new Error("Expected seat-attributed event");
     expect(event.seats.sort((a, b) => a.id.localeCompare(b.id))).toEqual(
       hold.items.map((item) => ({ id: item.seat.id, label: item.seat.label })).sort((a, b) => a.id.localeCompare(b.id)),
     );
@@ -340,8 +343,8 @@ describe("booking HTTP boundary against Postgres", () => {
     const mine = await snapshot(0);
     expect(mine.yourHold?.id).toBe(first.body.id);
     expect(mine.seats.filter((s) => s.heldByYou).map((s) => s.label)).toEqual(["B1", "B2"]);
-    expect(mine.seats.find((s) => s.label === "B1")?.hold).toEqual({ id: first.body.id, expiresAt: first.body.expiresAt });
-    expect((await snapshot(1)).seats.find((s) => s.label === "B1")?.hold).toEqual({ id: first.body.id, expiresAt: first.body.expiresAt });
+    expect(mine.seats.find((s) => s.label === "B1")?.hold).toEqual({ id: first.body.id, expiresAt: first.body.expiresAt, payment: "none" });
+    expect((await snapshot(1)).seats.find((s) => s.label === "B1")?.hold).toEqual({ id: first.body.id, expiresAt: first.body.expiresAt, payment: "none" });
     const anonymous = await snapshot();
     expect(anonymous.yourHold).toBeNull();
     expect(anonymous.seats.every((s) => !s.heldByYou)).toBe(true);
@@ -462,7 +465,7 @@ describe("booking HTTP boundary against Postgres", () => {
       if (fastResult) expect((await fastResult).status).toBe(201);
     }
     const events = await prisma.domainEvent.findMany({ where: { screeningId }, orderBy: { id: "asc" } });
-    expect(events.map((e) => SeatEventSchema.parse(e.payload).seats[0]!.label)).toEqual(["A1", "A2"]);
+    expect(events.map((e) => { const event = SeatEventSchema.parse(e.payload); return "seats" in event ? event.seats[0]!.label : null; })).toEqual(["A1", "A2"]);
     expect((await snapshot()).lastEventId).toBe(events[1]!.id.toString());
   });
 
@@ -576,5 +579,177 @@ describe("booking HTTP boundary against Postgres", () => {
     expect(Object.keys(doc.paths["/auth/demo-session"].post.responses)).toEqual(expect.arrayContaining(["400", "429", "503"]));
     expect(Object.keys(doc.paths["/screenings/{screeningId}/holds"].post.responses)).toEqual(expect.arrayContaining(["400", "401", "404", "409", "503"]));
     expect(Object.keys(doc.paths["/screenings/{screeningId}/snapshot"].get.responses)).toEqual(expect.arrayContaining(["400", "401", "404", "503"]));
+  });
+});
+
+describe("Week 3 payment HTTP transactions", () => {
+  const pay = (holdId: string, customer = 0, scenario = "success", key = randomUUID()) =>
+    request(app).post(`/holds/${holdId}/payments`).auth(token(customer), { type: "bearer" }).set("Idempotency-Key", key).send({ scenario });
+  const notify = (id: string, outcome = "succeeded", providerEventId = randomUUID()) => {
+    const body = JSON.stringify({ providerEventId, paymentAttemptId: id, outcome, occurredAt: new Date().toISOString() });
+    return request(app).post("/payments/notifications").set("Content-Type", "application/json")
+      .set("x-seatrush-signature", signPaymentNotification(webhookSecret, body)).send(body);
+  };
+  const expire = (id: string) => prisma.$executeRaw`UPDATE holds SET created_at=now()-interval '6 minutes',expires_at=now()-interval '1 minute' WHERE id=${id}::uuid`;
+  afterEach(async () => {
+    for (const event of await prisma.domainEvent.findMany({ where: { screeningId } })) SeatEventSchema.parse(event.payload);
+    const report = await checkSeatInvariants(prisma, screeningId);
+    expect(report.ok).toBe(true);
+  });
+  it("confirms once, replays initiation, rejects concurrent attempts, and protects owner reads", async () => {
+    const held = await hold(0, ["C1", "C2"]); const key = randomUUID();
+    const attempt = await pay(held.body.id, 0, "success", key); expect(attempt.status).toBe(201);
+    expect((await pay(held.body.id, 0, "success", key)).body.id).toBe(attempt.body.id);
+    expect((await pay(held.body.id)).body.error.code).toBe("payment_in_progress");
+    expect((await request(app).get(`/holds/${held.body.id}`).auth(token(), { type: "bearer" })).body.latestPaymentAttemptId).toBe(attempt.body.id);
+    const eventId = randomUUID();
+    const burst = await Promise.all(Array.from({ length: 20 }, () => notify(attempt.body.id, "succeeded", eventId)));
+    expect(burst.every((response) => response.status === 200)).toBe(true);
+    expect(burst.filter((response) => response.body.disposition === "applied")).toHaveLength(1);
+    expect(burst.filter((response) => response.body.disposition === "duplicate")).toHaveLength(19);
+    expect(await prisma.bookedSeat.count({ where: { booking: { paymentAttemptId: attempt.body.id } } })).toBe(2);
+    expect(await prisma.domainEvent.count({ where: { kind: "booking.confirmed", screeningId } })).toBe(1);
+    expect(await prisma.domainEvent.count({ where: { kind: "payment.notification_ignored", screeningId } })).toBe(1);
+    await Promise.all(Array.from({ length: 5 }, () => notify(attempt.body.id, "succeeded", eventId)));
+    expect(await prisma.domainEvent.count({ where: { kind: "payment.notification_ignored", screeningId } })).toBe(1);
+    const finalEvent = randomUUID();
+    expect((await notify(attempt.body.id, "processing", finalEvent)).body.disposition).toBe("ignored");
+    await Promise.all(Array.from({ length: 5 }, () => notify(attempt.body.id, "processing", finalEvent)));
+    expect(await prisma.domainEvent.count({ where: { kind: "payment.notification_ignored", screeningId,
+      payload: { path: ["reason"], equals: "already_final" } } })).toBe(1);
+    expect((await notify(attempt.body.id, "failed", eventId)).status).toBe(409);
+    const payment = await request(app).get(`/payments/${attempt.body.id}`).auth(token(), { type: "bearer" });
+    const booking = await request(app).get(`/bookings/${payment.body.bookingId}`).auth(token(), { type: "bearer" });
+    expect(booking.status).toBe(200); expect(booking.body.tickets).toHaveLength(2);
+    expect(await prisma.booking.count({ where: { holdId: held.body.id } })).toBe(1);
+    expect((await request(app).get(`/payments/${attempt.body.id}`).auth(token(1), { type: "bearer" })).status).toBe(404);
+    expect((await request(app).get(`/bookings/${payment.body.bookingId}`).auth(token(1), { type: "bearer" })).status).toBe(404);
+  });
+  it("retries failed payment and rejects expired payment starts", async () => {
+    const held = await hold(0, ["D1"]); const first = await pay(held.body.id);
+    expect(first.status).toBe(201);
+    expect((await notify(first.body.id, "failed")).status).toBe(200);
+    const second = await pay(held.body.id); expect(second.status).toBe(201);
+    expect((await notify(second.body.id)).status).toBe(200);
+    const old = await hold(1, ["D2"]); await expire(old.body.id);
+    expect((await pay(old.body.id, 1)).body.error.code).toBe("hold_not_active");
+  });
+  it("late success refunds without reclaiming reassigned seats", async () => {
+    const old = await hold(0, ["E1"]); const attempt = await pay(old.body.id); await expire(old.body.id);
+    const next = await hold(1, ["E1"]); expect(next.status).toBe(201);
+    expect((await notify(attempt.body.id)).status).toBe(200);
+    expect((await prisma.seat.findUniqueOrThrow({ where: { id: seats.E1! } })).currentHoldId).toBe(next.body.id);
+    expect(await prisma.refundRequired.count({ where: { paymentAttemptId: attempt.body.id, reason: "hold_expired" } })).toBe(1);
+    expect(await prisma.domainEvent.count({ where: { kind: "refund.required", screeningId } })).toBe(1);
+  });
+  it("authenticates decoded raw bytes and rejects invalid media types before database work", async () => {
+    const held = await hold(0, ["D3"]); const attempt = await pay(held.body.id);
+    const raw = JSON.stringify({ providerEventId: randomUUID(), paymentAttemptId: attempt.body.id, outcome: "succeeded", occurredAt: new Date().toISOString() });
+    const signature = signPaymentNotification(webhookSecret, raw);
+    const beforePayments = await prisma.paymentEvent.count();
+    const beforeEvents = await prisma.domainEvent.count();
+    for (const [body, signed] of [
+      [JSON.stringify(JSON.parse(raw), null, 2), signature],
+      [raw, signature.toUpperCase()],
+      [raw, signPaymentNotification(secret, raw)],
+      [raw, ""],
+    ]) {
+      const response = await request(app).post("/payments/notifications").set("Content-Type", "application/json")
+        .set("x-seatrush-signature", signed!).send(body);
+      expect(response.status).toBe(401); expect(response.body.error.code).toBe("invalid_signature");
+      expect(await prisma.paymentEvent.count()).toBe(beforePayments);
+      expect(await prisma.domainEvent.count()).toBe(beforeEvents);
+    }
+    const malformed = "not JSON";
+    const invalid = await request(app).post("/payments/notifications").set("Content-Type", "application/json")
+      .set("x-seatrush-signature", signPaymentNotification(webhookSecret, malformed)).send(malformed);
+    expect(invalid.status).toBe(400); expect(invalid.body.error.code).toBe("invalid_json");
+    for (const mediaType of ["text/plain", null]) {
+      const pending = request(app).post("/payments/notifications").set("x-seatrush-signature", signature).send(raw);
+      if (mediaType) pending.set("Content-Type", mediaType); else pending.unset("Content-Type");
+      const response = await pending;
+      expect(response.status).toBe(415); expect(response.body.error.code).toBe("unsupported_media_type");
+    }
+    expect(await prisma.paymentEvent.count()).toBe(beforePayments);
+    expect(await prisma.domainEvent.count()).toBe(beforeEvents);
+  });
+  it("refunds success after release and reassignment without touching the new owner", async () => {
+    const old = await hold(0, ["E2"]); const attempt = await pay(old.body.id);
+    expect((await request(app).delete(`/holds/${old.body.id}`).auth(token(), { type: "bearer" })).status).toBe(200);
+    const next = await hold(1, ["E2"]); expect(next.status).toBe(201);
+    expect((await notify(attempt.body.id)).status).toBe(200);
+    expect((await prisma.seat.findUniqueOrThrow({ where: { id: seats.E2! } })).currentHoldId).toBe(next.body.id);
+    expect(await prisma.refundRequired.count({ where: { paymentAttemptId: attempt.body.id, reason: "hold_released" } })).toBe(1);
+    const payment = await request(app).get(`/payments/${attempt.body.id}`).auth(token(), { type: "bearer" });
+    expect(payment.body.refund.reason).toBe("hold_released"); expect(payment.body.bookingId).toBeNull();
+  });
+  it("rechecks seat pointers after customer-lock waits for notifications and payment starts", async () => {
+    for (const mode of ["notification", "start"] as const) {
+      const customer = mode === "notification" ? 0 : 2;
+      const label = mode === "notification" ? "E3" : "E4";
+      const old = await hold(customer, [label]);
+      const attempt = mode === "notification" ? await pay(old.body.id, customer) : null;
+      const locked = Promise.withResolvers<void>(); const unlock = Promise.withResolvers<void>();
+      const blocker = prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM identities WHERE id=${customers[customer]}::uuid FOR NO KEY UPDATE`;
+        locked.resolve(); await unlock.promise;
+      }, { timeout: 10000 });
+      await locked.promise;
+      let pending: Promise<request.Response> | undefined;
+      try {
+        await prisma.$executeRaw`UPDATE holds SET created_at=now()-interval '5 minutes'+interval '400 milliseconds',
+          expires_at=now()+interval '400 milliseconds' WHERE id=${old.body.id}::uuid`;
+        pending = (mode === "notification" ? notify(attempt!.body.id) : pay(old.body.id, customer)).then((response) => response);
+        let waiting = false;
+        for (let poll = 0; poll < 100; poll++) {
+          const [state] = await prisma.$queryRaw<{waiting:boolean}[]>`SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+            WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%FROM identities%') AS waiting`;
+          if (state?.waiting) { waiting = true; break; }
+          await delay(5);
+        }
+        expect(waiting).toBe(true);
+        await delay(450);
+        const next = await hold(customer + 1, [label]); expect(next.status).toBe(201);
+        unlock.resolve(); await blocker;
+        const response = await pending;
+        expect(response.status).toBe(mode === "notification" ? 200 : 409);
+        if (mode === "notification") {
+          expect(response.body.disposition).toBe("applied");
+          expect(await prisma.refundRequired.count({ where: { paymentAttemptId: attempt!.body.id, reason: "hold_expired" } })).toBe(1);
+          expect(await prisma.booking.count({ where: { paymentAttemptId: attempt!.body.id } })).toBe(0);
+        } else {
+          expect(response.body.error.code).toBe("hold_not_active");
+          expect(await prisma.paymentAttempt.count({ where: { holdId: old.body.id } })).toBe(0);
+        }
+        expect((await prisma.seat.findUniqueOrThrow({ where: { id: seats[label]! } })).currentHoldId).toBe(next.body.id);
+      } finally { unlock.resolve(); await blocker; await pending; }
+    }
+  });
+  it("serializes expiry-edge success versus parallel claims for 32 iterations", async () => {
+    let bookedOutcomes = 0; let refundedOutcomes = 0;
+    for (let iteration = 0; iteration < 32; iteration++) {
+      const label = `${"FGHI"[Math.floor(iteration / 8)]}${iteration % 8 + 1}`;
+      const old = await hold(0, [label]); expect(old.status).toBe(201);
+      const attempt = await pay(old.body.id); expect(attempt.status).toBe(201);
+      const edgeMs = iteration % 2 === 0 ? 0 : 100 + iteration;
+      await prisma.$executeRaw`UPDATE holds SET created_at=now()-interval '5 minutes'+${edgeMs}*interval '1 millisecond',
+        expires_at=now()+${edgeMs}*interval '1 millisecond' WHERE id=${old.body.id}::uuid`;
+      const [notification, claim] = await Promise.all([notify(attempt.body.id), hold(1, [label])]);
+      expect(notification.status).toBe(200); expect([201, 409]).toContain(claim.status);
+      const bookings = await prisma.booking.count({ where: { paymentAttemptId: attempt.body.id } });
+      const refunds = await prisma.refundRequired.count({ where: { paymentAttemptId: attempt.body.id } });
+      bookedOutcomes += bookings; refundedOutcomes += refunds;
+      expect(bookings + refunds).toBe(1);
+      if (bookings === 1) expect(claim.status).toBe(409);
+      if (claim.status === 201) {
+        expect(refunds).toBe(1);
+        expect((await prisma.seat.findUniqueOrThrow({ where: { id: seats[label]! } })).currentHoldId).toBe(claim.body.id);
+        expect((await request(app).delete(`/holds/${claim.body.id}`).auth(token(1), { type: "bearer" })).status).toBe(200);
+      }
+      expect((await checkSeatInvariants(prisma, screeningId)).ok).toBe(true);
+      if (refunds === 1) await prisma.$executeRaw`UPDATE holds SET status='expired' WHERE id=${old.body.id}::uuid`;
+    }
+    expect(bookedOutcomes).toBeGreaterThan(0);
+    expect(refundedOutcomes).toBeGreaterThan(0);
   });
 });

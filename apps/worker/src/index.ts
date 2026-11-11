@@ -1,10 +1,12 @@
 import { Redis } from "ioredis";
+import type { Worker } from "bullmq";
 import { createPrismaClient } from "@seatrush/db";
 import { EnvValidationError, parseEnv, workerEnvSchema, type WorkerEnv } from "@seatrush/shared";
 import { createLogger } from "./logger.js";
 import { createProcessors } from "./processors.js";
 import { startExpirySweep, type ExpirySweep } from "./expiry.js";
 import { startWorkers } from "./workers.js";
+import { startPaymentSweeps, type PaymentSweeps } from "./payment-sweeps.js";
 
 function loadEnv(): WorkerEnv {
   try {
@@ -32,14 +34,23 @@ connection.on("error", (err) => {
   logger.warn({ err }, "redis connection error");
 });
 
-const workers = startWorkers({ processors: createProcessors(prisma, logger), connection, logger });
+const workers: Worker[] = [];
 let sweep: ExpirySweep | undefined;
+let paymentSweeps: PaymentSweeps | undefined;
 
 let shuttingDown = false;
 async function shutdown(signal: NodeJS.Signals): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info({ signal }, "shutting down");
+  // Leave headroom before Docker's 10s SIGKILL. Interrupted work is replayed from durable
+  // job progress or DB reconciliation; no queue acknowledgement decides an ownership outcome.
+  const deadline = setTimeout(() => {
+    logger.error("worker shutdown deadline exceeded; unfinished work will be recovered");
+    connection.disconnect();
+    process.exit(1);
+  }, 9_000);
+  deadline.unref();
   let exitCode = 0;
   // close() lets active jobs finish and stops fetching new ones.
   if (sweep) {
@@ -53,9 +64,14 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
       exitCode = 1;
     }
   }
+  if (paymentSweeps) {
+    try { await paymentSweeps.close(); }
+    catch (err) { logger.error({ err }, "error closing payment sweeps"); exitCode = 1; }
+  }
   if (connection.status === "ready") await connection.quit();
   else connection.disconnect();
   await prisma.$disconnect();
+  clearTimeout(deadline);
   logger.info({ exitCode }, "shutdown complete");
   process.exit(exitCode);
 }
@@ -65,6 +81,16 @@ process.once("SIGINT", (signal) => void shutdown(signal));
 
 await connection.ping();
 sweep = await startExpirySweep({ connection, logger });
+paymentSweeps = await startPaymentSweeps({ connection, logger });
+workers.push(...startWorkers({
+  processors: createProcessors(prisma, logger, {
+    payments: paymentSweeps.payments,
+    refunds: paymentSweeps.refunds,
+    notificationUrl: env.PAYMENT_NOTIFICATION_URL,
+    webhookSecret: env.PAYMENT_WEBHOOK_SECRET,
+  }),
+  connection, logger,
+}));
 logger.info(
   { queues: workers.map((worker) => worker.name) },
   "worker ready",

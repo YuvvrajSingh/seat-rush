@@ -2,6 +2,9 @@ import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { Redis } from "ioredis";
 import { createLogger, logRedisConnectionErrors } from "../src/logger.js";
+import request from "supertest";
+import { createPrismaClient } from "@seatrush/db";
+import { createApp } from "../src/app.js";
 
 function capture() {
   const lines: Record<string, unknown>[] = [];
@@ -15,6 +18,20 @@ function capture() {
 }
 
 describe("createLogger redaction", () => {
+  it("redacts notification signatures from real HTTP completion logs", async () => {
+    const { lines, logger } = capture();
+    const prisma = createPrismaClient("postgresql://unused:unused@localhost:1/unused");
+    try {
+      const app = createApp({ prisma, logger, authTokenSecret: "unused", paymentWebhookSecret: "webhook-secret",
+        webOrigin: "http://localhost:3000", readinessChecks: { postgres: async () => {}, redis: async () => {} } });
+      const signature = "a".repeat(64);
+      expect((await request(app).post("/payments/notifications").set("x-seatrush-signature", signature).send({})).status).toBe(401);
+      expect(JSON.stringify(lines)).not.toContain(signature);
+      expect(lines).toContainEqual(expect.objectContaining({ req: expect.objectContaining({
+        headers: expect.objectContaining({ "x-seatrush-signature": "[Redacted]" }),
+      }) }));
+    } finally { await prisma.$disconnect(); }
+  });
   it("logs Redis connection errors once per outage and rearms after readiness", () => {
     const { lines, logger } = capture();
     const redis = new Redis({ lazyConnect: true });

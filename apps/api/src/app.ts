@@ -9,10 +9,11 @@ import { healthRouter } from "./routes/health.js";
 import { createOpenApiDocument } from "./openapi.js";
 import { READINESS_TIMEOUT_MS, type ReadinessChecks } from "./readiness.js";
 import { bookingRouter, type BookingDeps } from "./routes/booking.js";
+import { paymentRouter, type PaymentDeps } from "./routes/payments.js";
 
 export const JSON_BODY_LIMIT = "16kb";
 
-export interface AppDeps extends BookingDeps {
+export interface AppDeps extends BookingDeps, PaymentDeps {
   logger: Logger;
   readinessChecks: ReadinessChecks;
   /** Browser origin allowed by CORS. */
@@ -29,6 +30,7 @@ export function createApp(deps: AppDeps): Express {
   app.use(requestId());
   app.use(httpLogger(deps.logger));
   app.use(cors({ origin: deps.webOrigin, exposedHeaders: [REQUEST_ID_HEADER, "Retry-After"] }));
+  app.use("/payments/notifications", express.raw({ type: "application/json", limit: JSON_BODY_LIMIT }));
   app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
   app.use(
@@ -38,6 +40,7 @@ export function createApp(deps: AppDeps): Express {
     }),
   );
   app.use(bookingRouter(deps));
+  app.use(paymentRouter(deps));
 
   const openApiDocument = createOpenApiDocument();
   app.get("/openapi.json", (_req, res) => {

@@ -6,8 +6,7 @@ import { pino } from "pino";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { claimSeatsInTransaction, cleanupExpiredHoldInTransaction, createPrismaClient, emitHoldEvent } from "@seatrush/db";
 import { HoldSchema, QUEUE_NAMES, SeatEventSchema } from "@seatrush/shared";
-import { createProcessors } from "../src/processors.js";
-import { startExpirySweep } from "../src/expiry.js";
+import { processExpiryJob, startExpirySweep } from "../src/expiry.js";
 import { startWorkers } from "../src/workers.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -47,7 +46,7 @@ afterAll(async () => { await prisma.$disconnect(); });
 async function claim(customer = 0, seats = seatIds, db = prisma) {
   return db.$transaction(async (tx) => {
     const claimed = await claimSeatsInTransaction(tx, { screeningId, customerId: customerIds[customer]!, seatIds: seats });
-    const hold = HoldSchema.parse({ ...claimed, status: "active", createdAt: claimed.createdAt.toISOString(), expiresAt: claimed.expiresAt.toISOString() });
+    const hold = HoldSchema.parse({ ...claimed, status: "active", latestPaymentAttemptId: null, createdAt: claimed.createdAt.toISOString(), expiresAt: claimed.expiresAt.toISOString() });
     await emitHoldEvent(tx, "hold.created", hold, customerIds[customer]!);
     return hold;
   });
@@ -67,7 +66,7 @@ async function startQueue(workerCount = 1, db = prisma) {
   cleanup.push(async () => { await queue.obliterate({ force: true }); await queue.close(); });
   const workers: Worker[] = [];
   for (let index = 0; index < workerCount; index++) {
-    workers.push(...startWorkers({ processors: createProcessors(db, logger), connection, logger, prefix }));
+    workers.push(...startWorkers({ processors: { [QUEUE_NAMES.holdExpiry]: (job, token) => processExpiryJob(db, job, token, logger) }, connection, logger, prefix }));
   }
   cleanup.push(() => Promise.all(workers.map((worker) => worker.close())));
   await Promise.all(workers.map((worker) => worker.waitUntilReady()));
@@ -98,6 +97,7 @@ describe("hold expiry through real BullMQ and Postgres", () => {
     expect(event).toEqual({
       id: stored!.id.toString(), kind: "hold.expired", screeningId, holdId: hold.id, seats: hold.seats,
       at: stored!.createdAt.toISOString(),
+      expiresAt: (await prisma.hold.findUniqueOrThrow({ where: { id: hold.id } })).expiresAt.toISOString(),
     });
     expect(stored!.customerId).toBe(customerIds[0]);
     const created = await prisma.domainEvent.findFirstOrThrow({ where: { screeningId, kind: "hold.created" } });

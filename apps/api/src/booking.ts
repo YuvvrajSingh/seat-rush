@@ -13,6 +13,7 @@ export async function getHold(db: SqlTransaction, holdId: string, customerId: st
     SELECT jsonb_build_object('id', h.id, 'screeningId', h.screening_id,
       'status', CASE WHEN h.status = 'active' AND h.expires_at <= now() THEN 'expired' ELSE h.status END,
       'amountPaise', h.amount_paise, 'createdAt', h.created_at, 'expiresAt', h.expires_at,
+      'latestPaymentAttemptId', (SELECT id FROM payment_attempts WHERE hold_id = h.id ORDER BY created_at DESC, id DESC LIMIT 1),
       'seats', (SELECT jsonb_agg(jsonb_build_object('id', s.id, 'label', s.label) ORDER BY s.row, s.number)
         FROM hold_items hi JOIN seats s ON s.id = hi.seat_id WHERE hi.hold_id = h.id)) AS hold
     FROM holds h WHERE h.id = ${holdId}::uuid AND h.customer_id = ${customerId}::uuid`;
@@ -23,12 +24,18 @@ export async function getHold(db: SqlTransaction, holdId: string, customerId: st
 /** Ownership, viewer hold, DB time and event cursor share a single MVCC statement snapshot. */
 export async function getSnapshot(db: PrismaClient, screeningId: string, customerId: string | null) {
   const [row] = await db.$queryRaw<{ snapshot: unknown }[]>`
-    WITH state AS (
+    WITH live_holds AS MATERIALIZED (
+      SELECT h.*, p.id AS payment_id, coalesce(p.status, 'none') AS payment_status
+      FROM holds h LEFT JOIN LATERAL (
+        SELECT id, status FROM payment_attempts WHERE hold_id = h.id ORDER BY created_at DESC, id DESC LIMIT 1
+      ) p ON true
+      WHERE h.screening_id = ${screeningId}::uuid AND h.status = 'active' AND h.expires_at > now()
+    ), state AS (
       SELECT s.id, s.label, s.row, s.number,
         CASE WHEN EXISTS (SELECT 1 FROM booked_seats bs WHERE bs.seat_id = s.id AND bs.screening_id = s.screening_id)
           THEN 'confirmed' WHEN h.id IS NOT NULL THEN 'held' ELSE 'available' END AS state,
-        coalesce(h.customer_id = ${customerId}::uuid, false) AS yours, h.id AS hold_id, h.expires_at
-      FROM seats s LEFT JOIN holds h ON h.id = s.current_hold_id AND h.status = 'active' AND h.expires_at > now()
+        coalesce(h.customer_id = ${customerId}::uuid, false) AS yours, h.id AS hold_id, h.expires_at, h.payment_status
+      FROM seats s LEFT JOIN live_holds h ON h.id = s.current_hold_id
       WHERE s.screening_id = ${screeningId}::uuid
     )
     SELECT jsonb_build_object(
@@ -36,15 +43,17 @@ export async function getSnapshot(db: PrismaClient, screeningId: string, custome
         'durationMinutes', sc.duration_minutes, 'seatPricePaise', sc.seat_price_paise),
       'seats', (SELECT coalesce(jsonb_agg(jsonb_build_object('id', id, 'label', label, 'row', row,
         'number', number, 'state', state, 'heldByYou', yours AND state = 'held',
-        'hold', CASE WHEN state = 'held' THEN jsonb_build_object('id', hold_id, 'expiresAt', expires_at) ELSE NULL END)
+        'hold', CASE WHEN state = 'held' THEN jsonb_build_object('id', hold_id, 'expiresAt', expires_at,
+          'payment', payment_status) ELSE NULL END)
         ORDER BY row, number), '[]'::jsonb) FROM state),
       'counts', (SELECT jsonb_build_object('available', count(*) FILTER (WHERE state = 'available'),
         'held', count(*) FILTER (WHERE state = 'held'), 'confirmed', count(*) FILTER (WHERE state = 'confirmed')) FROM state),
       'yourHold', (SELECT jsonb_build_object('id', h.id, 'screeningId', h.screening_id, 'status', 'active',
         'amountPaise', h.amount_paise, 'createdAt', h.created_at, 'expiresAt', h.expires_at,
+        'latestPaymentAttemptId', h.payment_id,
         'seats', (SELECT jsonb_agg(jsonb_build_object('id', s.id, 'label', s.label) ORDER BY s.row, s.number)
           FROM hold_items hi JOIN seats s ON s.id = hi.seat_id WHERE hi.hold_id = h.id))
-        FROM holds h WHERE h.screening_id = sc.id AND h.customer_id = ${customerId}::uuid AND h.status = 'active' AND h.expires_at > now()),
+        FROM live_holds h WHERE h.customer_id = ${customerId}::uuid),
       'lastEventId', (SELECT last_event_id::text FROM screening_event_cursors WHERE screening_id = sc.id),
       'serverTime', now()) AS snapshot
     FROM screenings sc WHERE sc.id = ${screeningId}::uuid`;
@@ -95,7 +104,7 @@ export async function withDbRetry<T>(operation: () => Promise<T>): Promise<T> {
 export async function createHoldInTransaction(tx: SqlTransaction, screeningId: string, customerId: string, request: CreateHoldRequest,
   beforeEvent?: (hold: Hold) => Promise<void>) {
   const claimed = await claimSeatsInTransaction(tx, { screeningId, customerId, seatIds: request.seatIds });
-  const hold = HoldSchema.parse({ ...claimed, status: "active", createdAt: claimed.createdAt.toISOString(), expiresAt: claimed.expiresAt.toISOString() });
+  const hold = HoldSchema.parse({ ...claimed, latestPaymentAttemptId: null, status: "active", createdAt: claimed.createdAt.toISOString(), expiresAt: claimed.expiresAt.toISOString() });
   await beforeEvent?.(hold);
   await emitHoldEvent(tx, "hold.created", hold, customerId);
   return hold;

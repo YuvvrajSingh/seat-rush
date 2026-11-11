@@ -7,6 +7,7 @@ import { createLogger, logRedisConnectionErrors } from "./logger.js";
 import { postgresCheck, probeRedisOptions, READINESS_TIMEOUT_MS, redisCheck, withProbeTimeouts } from "./readiness.js";
 import { createExpiryQueue } from "./expiry-queue.js";
 import { createConflictChannel } from "./conflicts.js";
+import { createPaymentQueues } from "./payment-queues.js";
 
 /** In-flight requests get this long after SIGTERM/SIGINT before their sockets are destroyed. */
 const SHUTDOWN_GRACE_MS = 10_000;
@@ -35,6 +36,7 @@ const probePrisma = createPrismaClient(withProbeTimeouts(env.DATABASE_URL, READI
 const probeRedis = new Redis(env.REDIS_URL, probeRedisOptions(READINESS_TIMEOUT_MS));
 logRedisConnectionErrors(probeRedis, logger, "redis connection error");
 const expiryQueue = createExpiryQueue(env.REDIS_URL, logger);
+const paymentQueues = createPaymentQueues(env.REDIS_URL, logger);
 const conflictPublisher = new Redis(env.REDIS_URL, { maxRetriesPerRequest: 1, enableOfflineQueue: false, connectTimeout: 1_000, commandTimeout: 1_000 });
 logRedisConnectionErrors(conflictPublisher, logger, "conflict publisher connection error");
 const conflicts = createConflictChannel({ prisma, publisher: conflictPublisher, logger });
@@ -44,6 +46,9 @@ const app = createApp({
   webOrigin: env.WEB_ORIGIN,
   prisma,
   authTokenSecret: env.AUTH_TOKEN_SECRET,
+  paymentWebhookSecret: env.PAYMENT_WEBHOOK_SECRET,
+  enqueuePayment: paymentQueues.enqueuePayment,
+  enqueueRefund: paymentQueues.enqueueRefund,
   enqueueExpiry: (hold) => expiryQueue.enqueue(hold),
   conflicts,
   readinessChecks: { postgres: postgresCheck(probePrisma), redis: redisCheck(probeRedis) },
@@ -51,7 +56,7 @@ const app = createApp({
 const server = createServer(app);
 
 async function closeDependencies(): Promise<void> {
-  const drains = await Promise.allSettled([conflicts.close(), expiryQueue.close()]);
+  const drains = await Promise.allSettled([conflicts.close(), expiryQueue.close(), paymentQueues.close()]);
   for (const result of drains) {
     if (result.status === "rejected") logger.error({ err: result.reason }, "error draining background work");
   }

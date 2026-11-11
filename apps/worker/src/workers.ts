@@ -1,6 +1,6 @@
 import { isNotConnectionError, Worker, type ConnectionOptions } from "bullmq";
 import type { Logger } from "pino";
-import { ALL_QUEUE_NAMES } from "@seatrush/shared";
+import { ALL_QUEUE_NAMES, QUEUE_NAMES } from "@seatrush/shared";
 import type { ProcessorRegistry } from "./processors.js";
 
 export interface StartWorkersOptions {
@@ -18,7 +18,8 @@ export function startWorkers({ processors, connection, logger, prefix }: StartWo
     const processor = processors[queueName];
     if (!processor) continue;
     const log = logger.child({ queue: queueName });
-    const worker = new Worker(queueName, processor, { connection, ...(prefix === undefined ? {} : { prefix }) });
+    const concurrency = queueName === QUEUE_NAMES.paymentEvents ? 32 : queueName === QUEUE_NAMES.refunds ? 8 : 1;
+    const worker = new Worker(queueName, processor, { connection, concurrency, ...(prefix === undefined ? {} : { prefix }) });
     worker.on("failed", (job, err) =>
       log.error({ err, jobId: job?.id, attemptsMade: job?.attemptsMade }, "job failed"),
     );
