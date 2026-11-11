@@ -1,6 +1,6 @@
 "use client";
 
-import type { DemoSessionResponse } from "@seatrush/shared";
+import type { DemoSessionResponse, PaymentAttempt, PaymentScenario } from "@seatrush/shared";
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import { createActionKeys, holdAction, releaseAction } from "../../lib/action-keys.js";
 import { ApiError, createBookingApi } from "../../lib/booking-api.js";
@@ -12,8 +12,17 @@ import {
   type Failure,
 } from "../../lib/booking-state.js";
 import { clockOffsetMs } from "../../lib/countdown.js";
-import { browserSessionStore, clearDemoSession, loadDemoSession, saveDemoSession } from "../../lib/demo-session.js";
+import {
+  browserSessionStore,
+  clearDemoSession,
+  loadDemoSession,
+  loadTrackedPayment,
+  saveDemoSession,
+  saveTrackedPayment,
+} from "../../lib/demo-session.js";
 import { createHoldCheck } from "../../lib/hold-check.js";
+import { createPaymentTracker, type PaymentTracker } from "../../lib/payment-tracker.js";
+import { POLL_RETRY_MS, payAction, paymentPhase, paymentRequest } from "../../lib/payment.js";
 
 /** Snapshot re-fetch interval while the tab is visible. Interim until the event stream lands. */
 export const SNAPSHOT_INTERVAL_MS = 2_000;
@@ -59,9 +68,10 @@ export function useBooking(apiUrl: string) {
   const epoch = useRef(0);
   const refreshing = useRef<Promise<void> | null>(null);
   const refreshAgain = useRef(false);
-  // Hold and release keep separate keys so retrying one never retires the other's.
+  // Hold, release and pay keep separate keys so retrying one never retires another's.
   const holdKeys = useMemo(() => createActionKeys(), []);
   const releaseKeys = useMemo(() => createActionKeys(), []);
+  const payKeys = useMemo(() => createActionKeys(), []);
 
   /** One demo identity per tab: reused from sessionStorage, otherwise issued once by the server. */
   const ensureSession = useCallback(async (): Promise<string> => {
@@ -233,5 +243,108 @@ export function useBooking(apiUrl: string) {
     await refresh();
   }, [api, ensureSession, refresh, releaseKeys, renewSession]);
 
-  return { state, toggleSeat, holdSeats, releaseHold, refresh };
+  /** Applies an attempt; a final one ends the hold, so earlier snapshots go stale and the map refreshes. */
+  const applyAttempt = useCallback(
+    (attempt: PaymentAttempt) => {
+      const settled = paymentPhase(attempt).kind !== "waiting";
+      dispatch({ type: "payment-status", attempt, epoch: settled ? ++epoch.current : 0 });
+      if (settled) void refresh();
+    },
+    [refresh],
+  );
+
+  /** Follows payments outside React; see payment-tracker.ts. One per mount. */
+  const tracker = useRef<PaymentTracker | null>(null);
+  useEffect(() => {
+    const store = browserSessionStore();
+    const created = createPaymentTracker({
+      getPayment: async (id) => api.getPayment(id, await ensureSession()),
+      getHold: async (holdId) => api.getHold(holdId, await ensureSession()),
+      onAttempt: applyAttempt,
+      onGone: (paymentAttemptId) => dispatch({ type: "payment-gone", paymentAttemptId }),
+      load: () => loadTrackedPayment(store),
+      save: (ref) => saveTrackedPayment(store, ref),
+      isVisible: () => document.visibilityState === "visible",
+    });
+    tracker.current = created;
+    created.resume();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") created.visible();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      created.stop();
+      if (tracker.current === created) tracker.current = null;
+    };
+  }, [api, applyAttempt, ensureSession]);
+
+  // The hold's latest attempt may be one this page never heard about (a start answer that was lost).
+  const latestAttemptId = state.hold?.latestPaymentAttemptId ?? null;
+  useEffect(() => {
+    if (latestAttemptId) tracker.current?.consider(latestAttemptId);
+  }, [latestAttemptId]);
+
+  const pay = useCallback(
+    async (scenario: PaymentScenario) => {
+      const { pending, hold } = stateRef.current;
+      if (pending || !hold) return;
+      dispatch({ type: "pay-start" });
+      const request = paymentRequest(scenario);
+      const action = payAction(hold.id, request);
+      // Recorded before sending, so a lost answer is recovered from the hold, even after a reload.
+      tracker.current?.starting(hold.id);
+      try {
+        const token = await ensureSession();
+        const attempt = await api.startPayment(hold.id, request, token, payKeys.keyFor(action));
+        payKeys.settle(action);
+        renewed.current = false;
+        dispatch({ type: "pay-done", attempt });
+        tracker.current?.started(attempt);
+      } catch (error) {
+        payKeys.settle(action, error);
+        const failure = toFailure(error);
+        dispatch({ type: "pay-failed", failure, epoch: ++epoch.current });
+        if (failure.code === "unauthorized") await renewSession();
+        // Lost answers, payment_in_progress and already_confirmed: the hold names the attempt it has.
+        else tracker.current?.recoverHold(hold.id);
+        await refresh();
+      }
+    },
+    [api, ensureSession, payKeys, refresh, renewSession],
+  );
+
+  // A confirmed attempt names its booking: fetch the tickets, retrying until the box office answers.
+  const bookingId =
+    state.payment && !state.payment.booking && !state.payment.bookingUnavailable ? state.payment.attempt.bookingId : null;
+  useEffect(() => {
+    if (!bookingId) return;
+    let stopped = false;
+    let timer: number | undefined;
+    const load = async () => {
+      try {
+        const booking = await api.getBooking(bookingId, await ensureSession());
+        if (!stopped) dispatch({ type: "booking-loaded", booking });
+      } catch (error) {
+        if (stopped) return;
+        if (error instanceof ApiError && error.code === "not_found") {
+          dispatch({ type: "booking-unavailable", bookingId });
+          return;
+        }
+        timer = window.setTimeout(load, POLL_RETRY_MS);
+      }
+    };
+    void load();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [api, bookingId, ensureSession]);
+
+  const dismissPayment = useCallback(() => {
+    tracker.current?.forget();
+    dispatch({ type: "payment-dismissed" });
+  }, []);
+
+  return { state, toggleSeat, holdSeats, releaseHold, refresh, pay, dismissPayment };
 }

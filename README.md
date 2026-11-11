@@ -8,11 +8,11 @@ A cinema booking system built to be rushed: up to 1,000 simulated customers comp
 |---|---|
 | Week 1: schema, seat map, atomic holds, snapshot, seat events | Done |
 | Week 2: expiry worker, idempotency keys, conflict channel | Done |
-| Week 3: simulated payments, confirmation, refunds | Not started |
+| Week 3: simulated payments, confirmation, refunds | Done |
 | Week 4: operator dashboard, SSE stream, load generator, WebGL seat map | Not started |
 | Weeks 5–6: failure tests, deployment, benchmarks | Not started |
 
-What you can run today: the customer booking page (`/book`), the booking API, and the expiry worker. Payment and the dashboard don't exist yet; a hold ends when you release it or after five minutes.
+What you can run today: the customer booking page (`/book`) with simulated payment, confirmation and a printable ticket; the booking API; and the worker (hold expiry, simulated payment provider, refunds). The operator dashboard and load generator arrive in Week 4.
 
 ## Prerequisites
 
@@ -31,7 +31,9 @@ pnpm install
 
 # 2. Configure: one .env at the repo root, read by every app
 cp .env.example .env
-sed -i "s/^AUTH_TOKEN_SECRET=.*/AUTH_TOKEN_SECRET=$(openssl rand -hex 32)/" .env
+for name in AUTH_TOKEN_SECRET PAYMENT_WEBHOOK_SECRET; do
+  sed -i "s/^$name=.*/$name=$(openssl rand -hex 32)/" .env
+done
 
 # 3. Start PostgreSQL (host port 5433) and Redis (6379)
 pnpm infra:up
@@ -41,17 +43,19 @@ pnpm --filter @seatrush/db migrate:deploy
 pnpm --filter @seatrush/db seed
 ```
 
-`AUTH_TOKEN_SECRET` must be at least 32 characters; the API refuses to start with the template value. The seed is idempotent, so running it twice changes nothing.
+`AUTH_TOKEN_SECRET` and `PAYMENT_WEBHOOK_SECRET` must each be at least 32 characters; the API and worker refuse to start with the template values. The seed is idempotent, so running it twice changes nothing.
 
 Then start the three processes, each in its own terminal:
 
 ```bash
 pnpm --filter @seatrush/api dev      # API on http://localhost:4000
-pnpm --filter @seatrush/worker dev   # expiry worker (no port)
+pnpm --filter @seatrush/worker dev   # worker: hold expiry, simulated payment provider, refunds (no port)
 pnpm --filter @seatrush/web dev      # web app on http://localhost:3000
 ```
 
-Open <http://localhost:3000/book>. The page creates a demo customer for you, shows the live seat map (refreshed every 2 seconds), and lets you hold 1–4 seats, watch the five-minute countdown, and release them. Open the page in a second browser profile to act as a competing customer.
+Open <http://localhost:3000/book>. The page creates a demo customer for you, shows the live seat map (refreshed every 2 seconds), and lets you hold 1–4 seats, watch the five-minute countdown, pay, and get a booking reference with a printable ticket. Open the page in a second browser profile to act as a competing customer.
+
+Payment is simulated: you choose how the pretend payment provider behaves (approve, decline, approve after a delay, send the same notification twice, deliver notifications out of order, or fail delivery twice before succeeding). The worker plays that behaviour out and sends signed notifications to the API, which decides the outcome in one database transaction. Paying never extends the hold: a payment that succeeds after the hold has ended doesn't book the seats; it creates a refund record that the worker then refunds.
 
 ### Production build
 
@@ -119,7 +123,7 @@ Integration tests run real parallel requests against real PostgreSQL and Redis, 
 | `packages/shared` | `@seatrush/shared` | Domain constants, zod request/response/event schemas, env parsing |
 | `packages/db` | `@seatrush/db` | Prisma schema, SQL migrations (seat-claim functions and constraints), seed, invariant checks |
 | `apps/api` | `@seatrush/api` | Express 5 HTTP API |
-| `apps/worker` | `@seatrush/worker` | BullMQ worker: tidies expired holds, purges old idempotency records |
+| `apps/worker` | `@seatrush/worker` | BullMQ worker: tidies expired holds, plays the simulated payment provider (signed notifications to the API, 3 s timeout, retries with backoff, 32 deliveries at a time), completes refunds, and every 30 s re-queues any unfinished payment or refund whose Redis job was lost or exhausted |
 | `apps/web` | `@seatrush/web` | Next.js 16 customer UI |
 | `infra/` | | Docker Compose init scripts (creates `seatrush_test`) |
 
@@ -142,6 +146,8 @@ All variables live in the root `.env` (see `.env.example`). Never commit it.
 | `TEST_DATABASE_URL` | tests | `…/seatrush_test` |
 | `REDIS_URL` | api, worker | `redis://localhost:6379` |
 | `AUTH_TOKEN_SECRET` | api | required, ≥ 32 characters |
+| `PAYMENT_WEBHOOK_SECRET` | api, worker | required, ≥ 32 characters; signs simulated payment notifications |
+| `PAYMENT_NOTIFICATION_URL` | worker | `http://localhost:4000/payments/notifications` |
 | `API_PORT` | api | `4000` |
 | `API_DB_POOL_MAX` | api | `20` |
 | `WEB_ORIGIN` | api (CORS) | `http://localhost:3000` |
@@ -153,7 +159,7 @@ All variables live in the root `.env` (see `.env.example`). Never commit it.
 
 | Symptom | Fix |
 |---|---|
-| API exits with `AUTH_TOKEN_SECRET: must be at least 32 characters` | Generate one: step 2 above |
+| API or worker exits with `…_SECRET: must be at least 32 characters` | Generate them: step 2 above |
 | `permission denied … docker.sock` | `sudo usermod -aG docker $USER`, then log out and back in |
 | Port 5433 or 6379 already in use | Stop the other service, or change the ports in `docker-compose.yml` and `.env` |
 | `/readyz` returns 503 / `ECONNREFUSED 6379` | Containers stopped (e.g. after a reboot): `pnpm infra:up` |

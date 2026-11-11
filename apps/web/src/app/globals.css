@@ -262,3 +262,20 @@
     animation: screen-warm 700ms ease-out both;
   }
 }
+
+/* Printed tickets: plain black on white, no hall colours or photographs. After the dark-scheme block so it wins. */
+@media print {
+  :root {
+    color-scheme: light;
+    --paper: #ffffff;
+    --paper-raised: #ffffff;
+    --ink: #000000;
+    --ink-muted: #000000;
+    --rule: #000000;
+    --accent: #000000;
+  }
+
+  @page {
+    margin: 16mm;
+  }
+}

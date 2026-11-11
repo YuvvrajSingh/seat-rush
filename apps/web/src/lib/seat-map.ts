@@ -22,6 +22,8 @@ export interface SeatView {
   row: string;
   number: number;
   state: SeatState;
+  /** Another customer's hold on this seat has a payment waiting for the provider. Spoken, not drawn. */
+  paying: boolean;
 }
 
 export interface HallRow {
@@ -56,6 +58,7 @@ export function buildHall(seats: readonly SeatSnapshot[]): HallRow[] {
       row: seat.row,
       number: seat.number,
       state: seatState(seat),
+      paying: seat.state === "held" && !seat.heldByYou && seat.hold?.payment === "initiated",
     };
     const row = byRow.get(seat.row);
     if (row) row.push(view);
@@ -70,8 +73,12 @@ export function buildHall(seats: readonly SeatSnapshot[]): HallRow[] {
 /** The hall has a centre aisle between seats 5 and 6. */
 export const AISLE_AFTER = SEATS_PER_ROW / 2;
 
-/** Accessible name for a seat button, e.g. "B7, held by another customer". */
-export function seatAccessibleName(seat: Pick<SeatView, "label" | "state">, mark?: SeatMark): string {
+/** Accessible name for a seat button, e.g. "B7, held by another customer, payment in progress". */
+export function seatAccessibleName(
+  seat: Pick<SeatView, "label" | "state"> & { paying?: boolean },
+  mark?: SeatMark,
+): string {
   const state = SEAT_STATE_LABELS[seat.state].toLowerCase();
-  return mark === "taken" ? `${seat.label}, ${state}, just taken` : `${seat.label}, ${state}`;
+  const name = seat.paying ? `${seat.label}, ${state}, payment in progress` : `${seat.label}, ${state}`;
+  return mark === "taken" ? `${name}, just taken` : name;
 }

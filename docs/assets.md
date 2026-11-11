@@ -28,7 +28,7 @@ Avoid: gold foil, holographic effects, stars, film reels, popcorn, tilt, curl, g
 ## hold-expired
 
 - **File:** `apps/web/public/images/hold-expired.webp` (720×720, generated 2026-11-07). The cushion came out folded down rather than sprung up; kept because the image is quiet and on-palette. Regenerate if the metaphor matters.
-- **Used on:** customer booking page, beside the message that the hold expired and the seats are available again. The upholstery deliberately matches the available-seat colour.
+- **Used on:** customer booking page, as a decorative image (`alt=""`) beside the "not booked" refund explanation when a payment succeeds after the hold ended. The copy never claims the seats are free again, since another customer may hold them.
 - **Prompt:**
 
 ```text

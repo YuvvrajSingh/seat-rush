@@ -1,14 +1,19 @@
 import {
+  BookingSchema,
   DemoScreeningResponseSchema,
   DemoSessionResponseSchema,
   ErrorResponseSchema,
   HoldSchema,
+  PaymentAttemptSchema,
   REQUEST_ID_HEADER,
   ScreeningSnapshotSchema,
+  type Booking,
   type DemoSessionResponse,
   type ErrorCode,
   type Hold,
+  type PaymentAttempt,
   type ScreeningSnapshot,
+  type StartPaymentRequest,
 } from "@seatrush/shared";
 
 /** The part of a zod schema the client needs; keeps zod itself out of this package's imports. */
@@ -50,6 +55,11 @@ export interface BookingApi {
   createHold(screeningId: string, seatIds: readonly string[], token: string, idempotencyKey: string): Promise<Hold>;
   getHold(holdId: string, token: string): Promise<Hold>;
   releaseHold(holdId: string, token: string, idempotencyKey: string): Promise<Hold>;
+  /** Starts a simulated payment for the hold; the server computes the amount (FR-04). */
+  startPayment(holdId: string, request: StartPaymentRequest, token: string, idempotencyKey: string): Promise<PaymentAttempt>;
+  getPayment(paymentAttemptId: string, token: string): Promise<PaymentAttempt>;
+  /** Owner only: another customer's booking is 404, the same as one that does not exist. */
+  getBooking(bookingId: string, token: string): Promise<Booking>;
 }
 
 interface CallOptions {
@@ -60,7 +70,7 @@ interface CallOptions {
 }
 
 /**
- * Typed client for the Week-1 booking endpoints. Every response is validated against the shared
+ * Typed client for the booking endpoints. Every response is validated against the shared
  * contract; every failure becomes an {@link ApiError} with a stable code.
  */
 export function createBookingApi(
@@ -130,5 +140,18 @@ export function createBookingApi(
     getHold: async (holdId, token) => (await call(`/holds/${encodeURIComponent(holdId)}`, HoldSchema, { token })).body,
     releaseHold: async (holdId, token, idempotencyKey) =>
       (await call(`/holds/${encodeURIComponent(holdId)}`, HoldSchema, { method: "DELETE", token, idempotencyKey })).body,
+    startPayment: async (holdId, request, token, idempotencyKey) =>
+      (
+        await call(`/holds/${encodeURIComponent(holdId)}/payments`, PaymentAttemptSchema, {
+          method: "POST",
+          token,
+          idempotencyKey,
+          body: request,
+        })
+      ).body,
+    getPayment: async (paymentAttemptId, token) =>
+      (await call(`/payments/${encodeURIComponent(paymentAttemptId)}`, PaymentAttemptSchema, { token })).body,
+    getBooking: async (bookingId, token) =>
+      (await call(`/bookings/${encodeURIComponent(bookingId)}`, BookingSchema, { token })).body,
   };
 }

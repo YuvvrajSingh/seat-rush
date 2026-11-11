@@ -20,6 +20,19 @@ describe("buildHall", () => {
     expect(hall[0]?.seats.map((seat) => seat.number)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(hall[1]?.seats[6]).toMatchObject({ label: "B7", state: "held-by-you" });
   });
+
+  it("marks another customer's hold with a payment waiting on the provider, never your own", () => {
+    const paying = { id: "44444444-4444-4444-8444-444444444444", expiresAt: "2026-11-07T10:05:00.000Z", payment: "initiated" } as const;
+    const { seats } = makeSnapshot({
+      seats: {
+        A1: { state: "held", heldByYou: false, hold: paying },
+        A2: { state: "held", heldByYou: true, hold: paying },
+        A3: { state: "held", heldByYou: false, hold: { ...paying, payment: "failed" } },
+      },
+    });
+    const [a1, a2, a3] = buildHall(seats)[0]?.seats ?? [];
+    expect([a1?.paying, a2?.paying, a3?.paying]).toEqual([true, false, false]);
+  });
 });
 
 describe("seatAccessibleName", () => {
@@ -33,6 +46,15 @@ describe("seatAccessibleName", () => {
   it("adds why a seat is highlighted after a refused hold", () => {
     expect(seatAccessibleName({ label: "B7", state: "held-by-other" }, "taken")).toBe(
       "B7, held by another customer, just taken",
+    );
+  });
+
+  it("says when another customer's payment is in progress, before any refusal note", () => {
+    expect(seatAccessibleName({ label: "B7", state: "held-by-other", paying: true })).toBe(
+      "B7, held by another customer, payment in progress",
+    );
+    expect(seatAccessibleName({ label: "B7", state: "held-by-other", paying: true }, "taken")).toBe(
+      "B7, held by another customer, payment in progress, just taken",
     );
   });
 

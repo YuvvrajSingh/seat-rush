@@ -3,10 +3,11 @@ import {
   bookingReducer,
   holdNeedsCheck,
   initialBookingState,
+  panelView,
   type BookingAction,
   type BookingState,
 } from "../src/lib/booking-state.js";
-import { makeHold, makeSnapshot, seatId } from "./fixtures.js";
+import { ATTEMPT_ID, BOOKING_ID, makeAttempt, makeBooking, makeHold, makeSnapshot, seatId } from "./fixtures.js";
 
 function run(...actions: BookingAction[]): BookingState {
   return actions.reduce(bookingReducer, initialBookingState);
@@ -216,4 +217,137 @@ it("gives each notice a new id so the same message is announced again", () => {
   const again = bookingReducer(state, toggle("A6"));
   expect(again.notice?.text).toBe(state.notice?.text);
   expect(again.notice?.id).toBe((state.notice?.id ?? 0) + 1);
+});
+
+describe("payments", () => {
+  const hold = makeHold(["B7", "B8"]);
+  const held: BookingAction[] = [snapshot(), { type: "hold-done", hold, epoch: 1 }];
+  const started: BookingAction[] = [...held, { type: "pay-start" }, { type: "pay-done", attempt: makeAttempt() }];
+  const status = (overrides: Parameters<typeof makeAttempt>[0], epoch = 0): BookingAction => ({
+    type: "payment-status",
+    attempt: makeAttempt(overrides),
+    epoch,
+  });
+
+  it("waits for the provider with the hold still shown and says the payment was sent", () => {
+    const state = run(...started);
+    expect(state.pending).toBeNull();
+    expect(panelView(state)).toMatchObject({ kind: "hold", hold: { id: hold.id }, attempt: { status: "initiated" } });
+    expect(state.notice?.text).toContain("₹400");
+  });
+
+  it("keeps the hold after a decline so the customer can try again", () => {
+    const state = run(...started, status({ status: "failed" }));
+    expect(state.hold?.id).toBe(hold.id);
+    expect(panelView(state)).toMatchObject({ kind: "hold", attempt: { status: "failed" } });
+    expect(state.notice).toMatchObject({ kind: "announce" });
+    expect(state.notice?.text).toContain("still held");
+  });
+
+  it("announces each phase once, not on every repeated poll", () => {
+    const declined = run(...started, status({ status: "failed" }));
+    expect(bookingReducer(declined, status({ status: "failed" })).notice?.id).toBe(declined.notice?.id);
+  });
+
+  it("shows the booking once confirmed, ends the hold and ignores snapshots requested before", () => {
+    const booked = run(...started, status({ status: "succeeded", bookingId: BOOKING_ID }, 2));
+    expect(booked.hold).toBeNull();
+    expect(panelView(booked)).toMatchObject({ kind: "booked", bookingId: BOOKING_ID });
+    expect(booked.notice?.text).toBe("Payment approved. B7 and B8 are booked for you.");
+
+    const stale = bookingReducer(booked, snapshot({ yourHold: hold, lastEventId: "9" }, 1));
+    expect(stale.hold).toBeNull();
+
+    const loaded = bookingReducer(booked, { type: "booking-loaded", booking: makeBooking(["B7", "B8"]) });
+    expect(loaded.payment?.booking?.reference).toBe("SR-7KQ2XM");
+    const other = bookingReducer(booked, {
+      type: "booking-loaded",
+      booking: makeBooking(["C1"], { id: "88888888-8888-4888-8888-888888888888" }),
+    });
+    expect(other.payment?.booking).toBeNull();
+  });
+
+  it("never steps back to waiting on a slow, older answer", () => {
+    const booked = run(...started, status({ status: "succeeded", bookingId: BOOKING_ID }, 2));
+    expect(bookingReducer(booked, status({})).payment).toBe(booked.payment);
+  });
+
+  it("keeps the booking on screen until dismissed; seat presses meanwhile explain how to go on", () => {
+    const booked = run(...started, status({ status: "succeeded", bookingId: BOOKING_ID }, 2));
+    const pressed = bookingReducer(booked, toggle("A1"));
+    expect(pressed.selection).toEqual([]);
+    expect(pressed.notice?.text).toContain("Choose seats again");
+    expect(panelView(bookingReducer(booked, { type: "payment-dismissed" }))).toEqual({ kind: "selection" });
+  });
+
+  it("explains a hold that runs out while the provider has the payment, then the refund", () => {
+    const expired = run(...started, { type: "hold-status", hold: { ...hold, status: "expired" } });
+    expect(expired.hold).toBeNull();
+    expect(panelView(expired)).toMatchObject({ kind: "paying-after-hold" });
+    expect(expired.notice).toMatchObject({ kind: "expired" });
+    expect(expired.notice?.text).toContain("refunded");
+    expect(expired.notice?.text).not.toMatch(/available/i);
+
+    const refunding = bookingReducer(
+      expired,
+      status({ status: "succeeded", refund: { status: "required", amountPaise: 40_000, reason: "hold_expired" } }, 2),
+    );
+    expect(panelView(refunding)).toMatchObject({ kind: "refund" });
+    expect(refunding.notice?.text).toContain("not booked");
+    expect(refunding.notice?.text).toContain("₹400");
+  });
+
+  it("says a release during payment means a late approval is refunded", () => {
+    const state = run(...started, { type: "release-start" }, { type: "release-done", hold: { ...hold, status: "released" }, epoch: 2 });
+    expect(state.notice?.text).toContain("refunded");
+    expect(panelView(state)).toMatchObject({ kind: "paying-after-hold" });
+  });
+
+  it("explains a refused start and keeps the hold", () => {
+    const state = run(...held, { type: "pay-start" }, { type: "pay-failed", failure: { code: "payment_in_progress" }, epoch: 2 });
+    expect(state.pending).toBeNull();
+    expect(state.hold?.id).toBe(hold.id);
+    expect(state.notice?.text).toContain("already with the provider");
+  });
+
+  it("forgets an attempt the server no longer shows this session", () => {
+    const state = run(...started, { type: "payment-gone", paymentAttemptId: ATTEMPT_ID });
+    expect(state.payment).toBeNull();
+  });
+});
+
+describe("payment races", () => {
+  const hold = makeHold(["B7", "B8"]);
+  const held: BookingAction[] = [snapshot(), { type: "hold-done", hold, epoch: 1 }, { type: "pay-start" }];
+
+  it("does not announce a start when a slow start answer arrives after the recovered booking", () => {
+    const booked = run(...held, {
+      type: "payment-status",
+      attempt: makeAttempt({ status: "succeeded", bookingId: BOOKING_ID }),
+      epoch: 2,
+    });
+    const late = bookingReducer(booked, { type: "pay-done", attempt: makeAttempt() });
+    expect(late.pending).toBeNull();
+    expect(late.notice).toBe(booked.notice);
+    expect(panelView(late)).toMatchObject({ kind: "booked" });
+  });
+
+  it("lets a newer attempt replace an older decline, never the reverse", () => {
+    const older = makeAttempt({ id: "99999999-9999-4999-8999-999999999999", status: "failed", createdAt: "2026-11-07T10:00:30.000Z" });
+    const declined = run(...held, { type: "pay-done", attempt: older });
+    const newer = bookingReducer(declined, { type: "payment-status", attempt: makeAttempt(), epoch: 0 });
+    expect(newer.payment?.attempt.id).toBe(ATTEMPT_ID);
+    const back = bookingReducer(newer, { type: "payment-status", attempt: older, epoch: 0 });
+    expect(back.payment?.attempt.id).toBe(ATTEMPT_ID);
+  });
+
+  it("ends the ticket spinner when the booking cannot be fetched", () => {
+    const booked = run(...held, {
+      type: "payment-status",
+      attempt: makeAttempt({ status: "succeeded", bookingId: BOOKING_ID }),
+      epoch: 2,
+    });
+    const state = bookingReducer(booked, { type: "booking-unavailable", bookingId: BOOKING_ID });
+    expect(state.payment).toMatchObject({ booking: null, bookingUnavailable: true });
+  });
 });

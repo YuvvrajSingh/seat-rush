@@ -1,18 +1,28 @@
 "use client";
 
-import { MAX_SEATS_PER_HOLD, SEAT_ROWS, SEATS_PER_ROW, type Hold, type ScreeningSnapshot } from "@seatrush/shared";
+import {
+  MAX_SEATS_PER_HOLD,
+  SEAT_ROWS,
+  SEATS_PER_ROW,
+  type Hold,
+  type PaymentAttempt,
+  type PaymentScenario,
+  type ScreeningSnapshot,
+} from "@seatrush/shared";
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useMemo, useRef } from "react";
 import { env } from "../../env.js";
-import type { BookingState, Notice } from "../../lib/booking-state.js";
+import { panelView, type BookingState, type Notice, type PanelView } from "../../lib/booking-state.js";
 import { formatSeatList } from "../../lib/messages.js";
 import { formatPaise } from "../../lib/money.js";
+import { paymentPhase } from "../../lib/payment.js";
 import { buildHall } from "../../lib/seat-map.js";
-import { primaryAction, secondaryAction } from "../actions.js";
+import { primaryAction } from "../actions.js";
 import { Auditorium, LegendItem, SeatLegend } from "../hall.js";
 import { Seat } from "../seat.js";
 import { HoldCountdown } from "./hold-countdown.js";
+import { BookedResult, PayingAfterHold, PaymentStep, RefundResult } from "./payment-panel.js";
 import { SeatGrid } from "./seat-grid.js";
 import { useBooking } from "./use-booking.js";
 
@@ -27,28 +37,39 @@ const clockFormat = new Intl.DateTimeFormat("en-IN", { hour: "numeric", minute: 
 
 const GRID_HELP_ID = "seat-grid-help";
 
+const PANEL_HEADINGS: Record<PanelView["kind"], string> = {
+  selection: "Your seats",
+  hold: "Held for you",
+  "paying-after-hold": "Hold ended",
+  booked: "Booked",
+  refund: "Not booked",
+};
+
 export function BookingScreen() {
-  const { state, toggleSeat, holdSeats, releaseHold, refresh } = useBooking(env.NEXT_PUBLIC_API_URL);
+  const { state, toggleSeat, holdSeats, releaseHold, refresh, pay, dismissPayment } = useBooking(
+    env.NEXT_PUBLIC_API_URL,
+  );
   const panelHeading = useRef<HTMLHeadingElement>(null);
   const { snapshot } = state;
+  const view = panelView(state);
 
   const rows = useMemo(() => (snapshot ? buildHall(snapshot.seats) : []), [snapshot]);
   const selection = useMemo(() => new Set(state.selection), [state.selection]);
   const taken = useMemo(() => new Set(state.taken), [state.taken]);
 
-  // Holding, releasing or expiry swaps the panel's contents, unmounting the button that had focus.
-  // Put focus on the panel heading as soon as that renders, unless the customer has moved on. The
-  // first snapshot only shows what is already true (a hold kept across a reload), so it moves nothing.
-  const holdId = state.hold?.id ?? null;
+  // Holding, paying, releasing or expiry swaps the panel's contents, unmounting the button that had
+  // focus. Put focus on the panel heading as soon as that renders, unless the customer has moved on.
+  // The first snapshot only shows what is already true (a hold kept across a reload), so it moves nothing.
+  const panelKey = `${view.kind}:${state.hold?.id ?? ""}:${view.kind === "hold" && view.attempt ? paymentPhase(view.attempt).kind : ""}`;
   const loaded = snapshot !== null;
-  const shownHoldId = useRef<string | null | undefined>(undefined);
+  const shownPanel = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (!loaded || shownHoldId.current === holdId) return;
-    const first = shownHoldId.current === undefined;
-    shownHoldId.current = holdId;
+    if (!loaded || shownPanel.current === panelKey) return;
+    const first = shownPanel.current === undefined;
+    shownPanel.current = panelKey;
     if (first) return;
     if (document.activeElement === null || document.activeElement === document.body) panelHeading.current?.focus();
-  }, [holdId, loaded]);
+  }, [panelKey, loaded]);
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-[90rem] flex-col px-gutter">
@@ -109,17 +130,25 @@ export function BookingScreen() {
             tabIndex={-1}
             className="font-display text-2xl font-bold focus-visible:outline-offset-4"
           >
-            {state.hold ? "Held for you" : "Your seats"}
+            {PANEL_HEADINGS[view.kind]}
           </h2>
-          {state.hold ? (
+          {view.kind === "hold" ? (
             <HoldDetails
-              key={state.hold.id}
-              hold={state.hold}
+              key={view.hold.id}
+              hold={view.hold}
+              attempt={view.attempt}
               clockOffsetMs={state.clockOffsetMs}
-              releasing={state.pending === "release"}
+              pending={state.pending}
+              onPay={pay}
               onRelease={releaseHold}
               onZero={refresh}
             />
+          ) : view.kind === "booked" ? (
+            <BookedResult payment={view.payment} bookingId={view.bookingId} onDismiss={dismissPayment} />
+          ) : view.kind === "refund" ? (
+            <RefundResult payment={view.payment} onDismiss={dismissPayment} />
+          ) : view.kind === "paying-after-hold" ? (
+            <PayingAfterHold attempt={view.attempt} />
           ) : (
             <SelectionDetails state={state} onHold={holdSeats} />
           )}
@@ -193,14 +222,18 @@ function SelectionDetails({ state, onHold }: { state: BookingState; onHold: () =
 
 function HoldDetails({
   hold,
+  attempt,
   clockOffsetMs,
-  releasing,
+  pending,
+  onPay,
   onRelease,
   onZero,
 }: {
   hold: Hold;
+  attempt: PaymentAttempt | null;
   clockOffsetMs: number;
-  releasing: boolean;
+  pending: BookingState["pending"];
+  onPay: (scenario: PaymentScenario) => void;
   onRelease: () => void;
   onZero: () => void;
 }) {
@@ -217,22 +250,20 @@ function HoldDetails({
           <HoldCountdown hold={hold} clockOffsetMs={clockOffsetMs} onZero={onZero} />
         </div>
       </dl>
-      <p className="mt-4 text-sm text-pretty text-ink-muted">
-        Paying is not open in this demo yet. Release the seats when you are done, or the hold ends by itself.
-      </p>
-      <button
-        type="button"
-        aria-disabled={releasing || undefined}
-        onClick={releasing ? undefined : onRelease}
-        className={`${secondaryAction} mt-5 w-full sm:w-auto`}
-      >
-        {releasing ? "Releasing…" : "Release seats"}
-      </button>
+      <PaymentStep
+        amountPaise={hold.amountPaise}
+        attempt={attempt}
+        starting={pending === "pay"}
+        releasing={pending === "release"}
+        onPay={onPay}
+        onRelease={onRelease}
+      />
     </>
   );
 }
 
 function NoticeView({ notice }: { notice: Notice }) {
+  if (notice.kind === "announce") return <p className="sr-only">{notice.text}</p>;
   if (notice.kind === "expired") {
     return (
       <div className="mt-6 flex items-center gap-4">

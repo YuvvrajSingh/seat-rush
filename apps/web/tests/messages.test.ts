@@ -1,7 +1,13 @@
 import { ERROR_CODES } from "@seatrush/shared";
 import { describe, expect, it } from "vitest";
 import type { FailureCode } from "../src/lib/booking-api.js";
-import { formatSeatList, holdFailureMessage, releaseFailureMessage } from "../src/lib/messages.js";
+import {
+  formatSeatList,
+  holdFailureMessage,
+  paymentFailureMessage,
+  refundMessage,
+  releaseFailureMessage,
+} from "../src/lib/messages.js";
 import { formatPaise } from "../src/lib/money.js";
 
 const ALL_CODES: FailureCode[] = [...ERROR_CODES, "network", "invalid_response"];
@@ -50,5 +56,28 @@ describe("formatPaise", () => {
     expect(formatPaise(80_000)).toBe("₹800");
     expect(formatPaise(120_000_00)).toBe("₹1,20,000");
     expect(formatPaise(20_050)).toBe("₹200.50");
+  });
+});
+
+describe("paymentFailureMessage", () => {
+  it("explains each refusal the payment step can meet without claiming money moved", () => {
+    expect(paymentFailureMessage({ code: "payment_in_progress" })).toContain("already with the provider");
+    expect(paymentFailureMessage({ code: "already_confirmed" })).toContain("Retrieving your confirmation");
+    expect(paymentFailureMessage({ code: "already_confirmed" })).not.toContain("booked");
+    expect(paymentFailureMessage({ code: "hold_not_active" })).toContain("no payment was started");
+  });
+
+  it("promises no double charge only when the same key will be resent", () => {
+    expect(paymentFailureMessage({ code: "network" })).toContain("will not charge twice");
+    expect(paymentFailureMessage({ code: "internal_error", requestId: "req-9" })).toContain("Reference req-9.");
+  });
+});
+
+describe("refundMessage", () => {
+  it("says the seats were not booked, why, and where the money is", () => {
+    expect(refundMessage("required", 40_000, "hold_expired")).toBe(
+      "The payment was approved after your hold had run out of time, so the seats were not booked. A refund of ₹400 is due and will start shortly.",
+    );
+    expect(refundMessage("refunded", 20_050, "hold_released")).toContain("₹200.50 has been refunded.");
   });
 });
