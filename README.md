@@ -2,6 +2,14 @@
 
 A cinema booking system built to be rushed: up to 1,000 simulated customers compete for 100 seats, and PostgreSQL guarantees no seat is ever sold twice. Requirements live in [`prd.md`](prd.md); design decisions in [`docs/adr/`](docs/adr).
 
+## 📚 Systems Programming & Architecture Guides
+
+If you want to understand how this high-concurrency transactional system works under the hood, explore the dedicated engineering manuals:
+
+- 🚀 **[Systems Programming Masterclass & Design Manual](docs/SYSTEMS_DESIGN.md)**: The executive architecture blueprint, mental model of high-contention races, and hands-on systems curriculum.
+- ⚙️ **[Systems & Concurrency Deep Dive](docs/SYSTEMS_CONCURRENCY_DEEP_DIVE.md)**: In-depth technical breakdown of PostgreSQL MVCC, row-locking hierarchies (`FOR NO KEY UPDATE`), deadlock prevention, atomic stored procedures, absorbing state machines, and the sequence cursor pattern.
+- 🗺️ **[Systems Architecture & Visual User Guide](docs/ARCHITECTURE_AND_USER_GUIDE.md)**: Component topology, Monorepo package seams, resilience analysis ("belt and suspenders" worker sweeps), and a step-by-step visual walkthrough annotated with real screenshots.
+
 ## Status
 
 | Delivery plan (prd §15) | State |
