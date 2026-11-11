@@ -13,6 +13,8 @@ export interface FailureInput {
   code: FailureCode;
   /** Labels of the seats the server named as unavailable, if it named any. */
   takenLabels?: readonly string[];
+  /** How many chosen seats remain in the selection after taken ones were removed. */
+  remainingCount?: number | undefined;
   requestId?: string | undefined;
 }
 
@@ -24,12 +26,19 @@ function reference(requestId: string | undefined): string {
  * What to tell the customer when a hold request fails. Each message says what happened to their
  * seats and what to do next. Only codes where the server guarantees nothing was reserved say so.
  */
-export function holdFailureMessage({ code, takenLabels = [], requestId }: FailureInput): string {
+export function holdFailureMessage({ code, takenLabels = [], remainingCount, requestId }: FailureInput): string {
   switch (code) {
     case "seat_unavailable":
-      return takenLabels.length > 0
-        ? `${formatSeatList(takenLabels)} ${takenLabels.length === 1 ? "was" : "were"} just taken by another customer, so nothing was held. The rest of your selection is still chosen.`
-        : "One of those seats was just taken by another customer, so nothing was held. Check the refreshed seat map and try again.";
+      if (takenLabels.length > 0) {
+        const list = formatSeatList(takenLabels);
+        const verb = takenLabels.length === 1 ? "was" : "were";
+        const suffix =
+          remainingCount === undefined || remainingCount > 0
+            ? " The rest of your selection is still chosen."
+            : " Choose other seats and try again.";
+        return `${list} ${verb} just taken by another customer, so nothing was held.${suffix}`;
+      }
+      return "One of those seats was just taken by another customer, so nothing was held. Check the refreshed seat map and try again.";
     case "active_hold_exists":
       return "You already hold seats for this screening. Release them to choose different ones.";
     case "invalid_seats":

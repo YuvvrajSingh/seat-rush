@@ -18,6 +18,12 @@ describe("holdFailureMessage", () => {
       "B7 and B8 were just taken by another customer, so nothing was held. The rest of your selection is still chosen.",
     );
   });
+  it("says to choose other seats when all selected seats were taken", () => {
+    expect(holdFailureMessage({ code: "seat_unavailable", takenLabels: ["B7"], remainingCount: 0 })).toBe(
+      "B7 was just taken by another customer, so nothing was held. Choose other seats and try again.",
+    );
+  });
+
 
   it("still explains a conflict when the server did not say which seat", () => {
     expect(holdFailureMessage({ code: "seat_unavailable" })).toMatch(/^One of those seats was just taken/);

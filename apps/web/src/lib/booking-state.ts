@@ -341,14 +341,20 @@ export function bookingReducer(state: BookingState, action: BookingAction): Book
       const base = { ...state, epoch: action.epoch, pending: null };
       if (code === "seat_unavailable") {
         const taken = seatIds.filter((id) => state.selection.includes(id));
+        const remaining = state.selection.filter((id) => !taken.includes(id));
         return {
           ...base,
-          selection: state.selection.filter((id) => !taken.includes(id)),
+          selection: remaining,
           taken,
           notice: notify(
             state,
             "problem",
-            holdFailureMessage({ code, takenLabels: labelsFor(state.snapshot, taken), requestId }),
+            holdFailureMessage({
+              code,
+              takenLabels: labelsFor(state.snapshot, taken),
+              remainingCount: remaining.length,
+              requestId,
+            }),
           ),
         };
       }

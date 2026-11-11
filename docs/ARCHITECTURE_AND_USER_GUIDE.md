@@ -167,20 +167,20 @@ The sequence diagram below provides a panoramic view of the entire eight-stage t
 sequenceDiagram
     autonumber
 
-    box rgba(224, 242, 254, 0.7) "Client Browser Tier"
+    box "Client Browser Tier"
         actor User as Customer Browser
         participant Web as Next.js 16 Web UI
     end
 
-    box rgba(254, 243, 199, 0.7) "API Gateway & Coordinator"
+    box "API Gateway & Coordinator"
         participant API as Express 5 API
     end
 
-    box rgba(243, 232, 255, 0.7) "Authoritative PostgreSQL 18"
+    box "Authoritative PostgreSQL 18"
         participant DB as PostgreSQL 18 Engine
     end
 
-    box rgba(209, 250, 229, 0.7) "Worker & Simulation Tier"
+    box "Worker & Simulation Tier"
         participant Queue as BullMQ / Redis 8
         participant Worker as Worker & Payment Simulator
     end
@@ -217,37 +217,52 @@ sequenceDiagram
 
     %% Phase 3: Local Selection
     Note over User,Worker: Phase 3: Local Seat Selection (Screen 3 - Zero Server Load)
-    User->>Web: Click seats D4, D5, D6
+    User->>Web: Click seats D4 and D5
     activate Web
     Note over Web: Local React State Update (anti-hoarding)<br/>Zero DB locks, zero network requests
-    Web-->>User: Highlight yellow ("Selected"), show subtotal ₹1,050.00
+    Web-->>User: Highlight yellow ("Selected"), show subtotal ₹400.00
     deactivate Web
 
     %% Phase 4: Atomic Hold
     Note over User,Worker: Phase 4: Atomic Hold & Countdown (Screen 4)
-    User->>Web: Click "Hold seats (5:00)"
+    User->>Web: Click "Hold 2 seats"
     activate Web
-    Web->>API: POST /screenings/:id/holds<br/>Headers: Idempotency-Key, Bearer Token<br/>Body: { seatIds: [D4, D5, D6] }
+    Web->>API: POST /screenings/:id/holds<br/>Headers: Idempotency-Key, Bearer Token<br/>Body: { seatIds: [D4, D5] }
     activate API
     API->>DB: BEGIN TRANSACTION (Read Committed)
     activate DB
     API->>DB: Reserve 30s Idempotency Lease (idempotency_records)
     API->>DB: SELECT claim_seats(screening_id, customer_id, seat_ids)
-    Note over DB: 1. SELECT seats ORDER BY id FOR NO KEY UPDATE<br/>2. GiST constraint: No active hold for customer<br/>3. UPDATE seats SET current_hold_id = h.id
-    DB-->>API: Hold row created (hold_id, expires_at: T+5m)
-    API->>DB: Record completed response in idempotency_records
-    API->>DB: COMMIT TRANSACTION
-    deactivate DB
-    API-)Queue: Best-effort enqueue hold-expiry (delay: 5m)
-    API-->>Web: 201 Created { holdId, expiresAt, serverTime, seats }
-    deactivate API
-    Web->>Web: Start synchronized countdown timer (5:00) with clockOffsetMs
-    Web-->>User: Display "Held for you" countdown panel
-    deactivate Web
+    Note over DB: 1. SELECT seats ORDER BY id FOR NO KEY UPDATE<br/>2. GiST constraint: No active hold for customer<br/>3. Conflict probe under fresh MVCC snapshot
 
+    alt Seats Free (Atomic Hold Success)
+        DB-->>API: Hold row created (hold_id, expires_at: T+5m)
+        API->>DB: Record 201 response in idempotency_records
+        API->>DB: COMMIT TRANSACTION
+        deactivate DB
+        API-)Queue: Best-effort enqueue hold-expiry (delay: 5m)
+        API-->>Web: 201 Created { holdId, expiresAt, serverTime, seats }
+        Web->>Web: Start synchronized countdown timer (5:00) with clockOffsetMs
+        Web-->>User: Display "Held for you" countdown panel
+    else Concurrency Collision (Seat Contested)
+        activate DB
+        DB-->>API: RAISE EXCEPTION 'seat conflict' USING ERRCODE = 'SR409'
+        API->>DB: Record 409 in idempotency_records & COMMIT
+        deactivate DB
+        API-->>Web: 409 Conflict { code: "seat_unavailable", seatIds: [D5] }
+        Web-->>User: Highlight contested seat & prune from selection
+    else Customer Active Hold Exists
+        activate DB
+        DB-->>API: RAISE EXCEPTION 'active hold exists' USING ERRCODE = 'SR410'
+        deactivate DB
+        API-->>Web: 409 Conflict { code: "active_hold_exists" }
+        Web-->>User: Display "You already hold seats" notice
+    end
+    deactivate API
+    deactivate Web
     %% Phase 5: Payment Initiation
     Note over User,Worker: Phase 5: Payment Initiation (Screen 5)
-    User->>Web: Select "delayed_success" & click "Pay ₹1,050.00"
+    User->>Web: Select "delayed_success" & click "Pay ₹400.00"
     activate Web
     Web->>API: POST /holds/:id/payments<br/>Body: { scenario: "delayed_success" }
     activate API
@@ -274,12 +289,29 @@ sequenceDiagram
     Note over User,Worker: Phase 7: Booking Confirmation & Absorbing State Commit
     API->>DB: BEGIN TRANSACTION
     activate DB
-    API->>DB: applyNotification() / guard_payment_transition()
-    Note over DB: 1. SELECT holds FOR UPDATE (assert expires_at > now())<br/>2. INSERT INTO bookings & booked_seats<br/>3. Lock screening_event_cursors FOR UPDATE<br/>4. INSERT INTO domain_events ('booking.confirmed')<br/>5. UPDATE payment_attempts SET status = 'succeeded'
-    DB-->>API: Confirmation successful (booking_id: UUID)
-    API->>DB: COMMIT TRANSACTION
-    deactivate DB
-    API-->>Worker: 200 OK { disposition: "applied", bookingId }
+    alt Hold Active & Unexpired (Booking Confirmed)
+        API->>DB: applyNotification() / guard_payment_transition()
+        Note over DB: 1. Lock holds FOR NO KEY UPDATE<br/>2. INSERT INTO bookings & booked_seats<br/>3. Lock screening_event_cursors FOR UPDATE<br/>4. INSERT INTO domain_events ('booking.confirmed')<br/>5. UPDATE payment_attempts SET status = 'succeeded'
+        DB-->>API: Confirmation successful (booking_id: UUID)
+        API->>DB: COMMIT TRANSACTION
+        deactivate DB
+        API-->>Worker: 200 OK { disposition: "applied", bookingId }
+    else Hold Expired or Released (Automated Refund Protection)
+        activate DB
+        API->>DB: UPDATE payment_attempts SET status = 'succeeded'
+        API->>DB: INSERT INTO refund_required (reason: 'hold_expired')
+        API->>DB: INSERT INTO domain_events ('refund.required')
+        API->>DB: COMMIT TRANSACTION
+        deactivate DB
+        API-)Queue: Enqueue refund processing job
+        API-->>Worker: 200 OK { disposition: "applied", refundRequiredId }
+    else Payment Declined (outcome = 'failed')
+        activate DB
+        API->>DB: UPDATE payment_attempts SET status = 'failed'
+        API->>DB: COMMIT TRANSACTION
+        deactivate DB
+        API-->>Worker: 200 OK { disposition: "applied" }
+    end
     deactivate API
     deactivate Worker
 
@@ -314,12 +346,12 @@ sequenceDiagram
 The user arrives at `http://localhost:3000`. The landing page displays:
 1. The **1,000 customers / 100 seats** challenge overview.
 2. An interactive 10×10 auditorium layout preview.
-3. The cinema's **House rules**: 1–4 seats per booking, 5-minute database-enforced hold window, integer-paise pricing (₹350.00 / 35,000 paise), and screening duration.
+3. The cinema's **House rules**: 1–4 seats per booking, 5-minute database-enforced hold window, integer-paise pricing (₹200.00 / 20,000 paise), and screening duration.
 4. A live **API Health Probe** status indicator.
 
 #### Systems Engineering Deep-Dive
 - **Dynamic Server Health Check:** The Next.js page uses React Server Components (`app/page.tsx`) with a streaming `<Suspense>` boundary around `<ApiStatus />` (`components/api-status.tsx`). Every page render dynamically pings `GET /healthz` on the Express API. The probe executes a single lightweight database ping (`SELECT 1`) on an isolated single-connection pool and a Redis `PING`. If either fails, the badge transitions to warning/error without taking down the static shell.
-- **Paise Representation (No Floating Point):** The house rules display `₹350.00`. In the database and shared schemas, this is stored strictly as `seatPricePaise: 35000` (`packages/shared/src/booking.ts`). Systems handling financial transactions must never use IEEE 754 floating-point numbers due to precision loss (e.g. `0.1 + 0.2 = 0.30000000000000004`). All calculations across SeatRush use integer arithmetic.
+- **Paise Representation (No Floating Point):** The house rules display `₹200.00`. The shared domain constant is `SEAT_PRICE_PAISE = 20_000` (`packages/shared/src/domain.ts`), and the per-screening price is stored as `screenings.seat_price_paise`. During hold claims, `claim_seats` reads this value under `FOR KEY SHARE` and multiplies it by seat count into `holds.amount_paise`. Systems handling financial transactions must never use IEEE 754 floating-point numbers due to precision loss (e.g. `0.1 + 0.2 = 0.30000000000000004`). All calculations across SeatRush use integer arithmetic.
 
 ---
 
@@ -346,7 +378,7 @@ Clicking **"Book seats"** navigates to `/book`. The client loads the full 10×10
   The server signs a lightweight bearer token:
   $$\text{Token} = \text{base64url}(\text{claims}) \mathbin{\Vert} \text{'.'}\mathbin{\Vert} \text{base64url}(\text{HMAC-SHA256}(\text{encoded\_claims}, \text{AUTH\_TOKEN\_SECRET}))$$
   There is no third-party JWT library and no external identity provider. The token is validated in constant time (`crypto.timingSafeEqual`) on subsequent calls. A per-IP rate limiter allows a maximum of 10 session creations per 60 seconds to prevent identity table exhaustion.
-- **DOM Accessibility vs Canvas:** Rather than drawing an unstyled WebGL or HTML5 canvas, the seat grid is rendered as a standards-compliant accessible DOM table (`role="grid"`). Each seat is an interactive button with `role="gridcell"`, `aria-label="Seat D5, ₹350.00, available"`, and arrow-key navigation (`grid-navigation.ts`). Screen readers announce state updates via `aria-live="polite"` regions.
+- **DOM Accessibility vs Canvas:** Rather than drawing an unstyled WebGL or HTML5 canvas, the seat grid is rendered as a standards-compliant accessible DOM table (`role="grid"`). Each seat is an interactive button with `role="gridcell"`, `aria-label="Seat D5, available"`, and arrow-key navigation (`grid-navigation.ts`). Screen readers announce state updates via `aria-live="polite"` regions.
 
 ---
 
@@ -355,7 +387,7 @@ Clicking **"Book seats"** navigates to `/book`. The client loads the full 10×10
 ![Seat Selection](screenshots/03-seat-selection.png)
 
 #### User Experience
-The user clicks on seats **D4, D5, and D6**. The seats highlight in yellow (`Selected`), and the side panel updates to show **"Your seats: D4, D5, D6"**, the subtotal **"₹1,050.00"**, and the primary action button **"Hold seats (5:00)"**.
+The user clicks on seats **D4 and D5**. The seats highlight in yellow (`Selected`), and the side panel updates to show **"D4 and D5"**, the rate informational text **"₹200 a seat. The box office works out the total when it holds your seats."**, and the primary action button **"Hold 2 seats"**.
 
 #### Systems Engineering Deep-Dive
 - **The Anti-Hoarding Pattern: Client-Side Selection vs Server Reservation:**
@@ -379,20 +411,20 @@ This single user action triggers one of the most sophisticated transactional wor
 ```mermaid
 sequenceDiagram
     autonumber
-    box rgba(224, 242, 254, 0.7) "Client Browser"
+    box "Client Browser"
         actor User as Client Browser
     end
-    box rgba(254, 243, 199, 0.7) "API Gateway & Coordinator"
+    box "API Gateway & Coordinator"
         participant API as Express API
     end
-    box rgba(243, 232, 255, 0.7) "Authoritative PostgreSQL 18"
+    box "Authoritative PostgreSQL 18"
         participant DB as PostgreSQL 18
     end
-    box rgba(209, 250, 229, 0.7) "Distributed Messaging"
+    box "Distributed Messaging"
         participant Redis as Redis / BullMQ
     end
 
-    User->>API: POST /screenings/:id/holds<br/>Headers: Idempotency-Key, Bearer Token<br/>Body: { seatIds: [D4, D5, D6] }
+    User->>API: POST /screenings/:id/holds<br/>Headers: Idempotency-Key, Bearer Token<br/>Body: { seatIds: [D4, D5] }
     activate API
     Note over API,DB: Start Read Committed Transaction
     API->>DB: Acquire 30s Idempotency Lease (idempotency_records)
@@ -404,7 +436,7 @@ sequenceDiagram
         Note over DB: Atomic claim_seats() Execution<br/>1. SELECT screenings FOR KEY SHARE<br/>2. SELECT identities FOR NO KEY UPDATE<br/>3. SELECT holds (prior owners) ORDER BY id FOR NO KEY UPDATE<br/>4. SELECT seats ORDER BY id FOR NO KEY UPDATE (deadlock prevention)<br/>5. Verify no active hold exists for customer (GiST exclusion)<br/>6. INSERT INTO holds & hold_items (5-minute TTL)<br/>7. UPDATE seats SET current_hold_id = h.id RETURNING s.id
     end
 
-    DB-->>API: Returns claimed seat IDs (D4, D5, D6)
+    DB-->>API: Returns claimed seat IDs (D4, D5)
     API->>DB: Store completed 201 response in idempotency_records
     API->>DB: COMMIT Transaction
     deactivate DB
@@ -418,11 +450,13 @@ sequenceDiagram
 1. **Idempotency Lease Fencing (`apps/api/src/idempotency.ts`):**
    The browser sends an `Idempotency-Key` header (UUID). The API executes an atomic lease reservation:
    ```sql
+   -- Phase 1 (Short committed transaction): Acquire or inspect 30-second lease
    INSERT INTO idempotency_records (customer_id, screening_id, operation, key, request_hash, status, locked_until)
    VALUES ($1, $2, 'hold.create', $3, $4, 'in_progress', now() + interval '30 seconds')
-   ON CONFLICT (customer_id, operation, key) DO UPDATE ...
+   ON CONFLICT (customer_id, operation, key) DO NOTHING
+   RETURNING id, locked_until::text AS "leaseToken";
    ```
-   If a network glitch causes the browser to retry while the first call is still executing, the second request sees `status = 'in_progress'` and is safely rejected with HTTP 409 `idempotency_in_progress` and a `Retry-After` header.
+   If the record already exists, the API inspects the existing hash: matching payloads reuse the lease or replay the stored 2xx/4xx response, while payload tampering under the same key returns HTTP 409 `idempotency_key_reused`. If a network glitch causes the browser to retry while the first call is still executing, the second request sees `status = 'in_progress'` and is safely rejected with HTTP 409 `idempotency_in_progress` and a `Retry-After` header.
 
 2. **The `claim_seats` Stored Procedure (`packages/db/prisma/migrations/.../migration.sql`):**
    To prevent race conditions and deadlocks, PostgreSQL executes `claim_seats`:
@@ -509,11 +543,10 @@ SeatRush models this faithfully by running the payment simulator in the worker d
 ![Seat Conflict 409](screenshots/06-seat-conflict-409.png)
 
 #### User Experience
-Two users in separate browser tabs attempt to hold seat **D5** at the same second. User 1's request commits first. User 2's screen immediately reacts:
-1. A warning banner appears: **"Seat D5 was just taken by another customer. Your other seats remain selected."**
-2. Seat D5 turns red on the interactive grid (`data-status="taken"`).
-3. The remaining unconflicted seats (D4 and D6) remain selected, allowing User 2 to immediately pick another replacement seat without starting over.
-
+The user selects seats **E4 and E5**. Meanwhile, another simulated customer claims seat **E5** via the API. When the user clicks "Hold 2 seats", the atomic reservation detects the conflict:
+1. A clear banner informs the customer: **"E5 was just taken by another customer, so nothing was held. The rest of your selection is still chosen."**
+2. Seat **E5** immediately updates to the dashed hourglass style (`Held by another customer`).
+3. Seat **E4** remains actively chosen in yellow, allowing the user to immediately click **"Hold 1 seat"** without losing their remaining selection.
 #### Systems Engineering Deep-Dive
 - **Structured Error Propagation:**
   When `claim_seats` detects that seat D5 already has an active hold or booking, it gathers all conflicting seat UUIDs into a JSONB array and raises custom SQLSTATE `SR409`:
@@ -534,7 +567,8 @@ Two users in separate browser tabs attempt to hold seat **D5** at the same secon
   {
     "error": {
       "code": "seat_unavailable",
-      "message": "Seat conflict",
+      "message": "Some requested seats are unavailable",
+      "requestId": "req_123...",
       "seatIds": ["f3a1...d5"]
     }
   }
@@ -567,12 +601,12 @@ Two users in separate browser tabs attempt to hold seat **D5** at the same secon
 #### User Experience
 Upon payment approval, the side panel unmounts the hold timer and presents the **Booking Confirmed** view. It renders a photorealistic cinema ticket stub with:
 - Movie title: *SeatRush: Opening Night*
-- Show date and confirmation timestamp
-- Booking reference: `SR-87B2E79F0BBF436BA70390FE...`
-- Seats: **D4, D5, D6**
-- Total amount paid: **₹1,050.00**
-- A prominent button: **"View printable ticket"**
-
+- Show date: *Thu, 12 Nov, 11:24 am*
+- Booking reference: `SR-BABD42EE3A104660A2BEC8D211765352`
+- Seat: **E4**
+- Total amount paid: **₹200.00**
+- Ticket code: `80ae6d40-5ceb-4f3b-a9ff-c05555edfbf7`
+- Actions: **"Printable ticket"** and **"Choose seats again"**
 #### Systems Engineering Deep-Dive
 - **Atomic Confirmation & Unique Constraints:**
   When the payment notification arrives, `applyNotification()` executes within a strict transaction:
@@ -586,13 +620,15 @@ Upon payment approval, the side panel unmounts the hold timer and presents the *
 - **Monotonic Domain Event Cursor (`screening_event_cursors`):**
   A durable domain event `booking.confirmed` is emitted in the exact same transaction:
   ```sql
-  SELECT last_event_id FROM screening_event_cursors
-  WHERE screening_id = p_screening_id FOR UPDATE;
+  -- Application executes normal event insert:
+  INSERT INTO domain_events (screening_id, booking_id, kind, payload)
+  VALUES (p_screening_id, p_booking_id, 'booking.confirmed', jsonb_build_object(...));
   
-  INSERT INTO domain_events (id, screening_id, booking_id, kind, payload)
-  VALUES (nextval('domain_events_id_seq'), p_screening_id, p_booking_id, 'booking.confirmed', ...);
-  
-  UPDATE screening_event_cursors SET last_event_id = ...;
+  -- Database trigger serialize_screening_event executes automatically:
+  -- 1. PERFORM screening_id FROM screening_event_cursors WHERE screening_id = NEW.screening_id FOR UPDATE;
+  -- 2. NEW.id := nextval('domain_events_id_seq');
+  -- 3. NEW.at := clock_timestamp();
+  -- 4. UPDATE screening_event_cursors SET last_event_id = NEW.id WHERE screening_id = NEW.screening_id;
   ```
   Because the event cursor is locked `FOR UPDATE` until transaction commit, events are guaranteed to become visible in strictly increasing sequential order without gaps or out-of-order timestamps.
 - **Hybrid Graphic Compositing (`apps/web/src/components/ticket-stub.tsx`):**
@@ -626,6 +662,48 @@ Clicking **"View printable ticket"** navigates to `/bookings/[bookingId]`. The p
   ```
   The photorealistic background image and dark theme colors are stripped completely, producing an ink-efficient, crisp black-and-white printout suitable for theater turnstiles.
 
+---
+
+### Screen 9: Print Media Admission Pass (`screenshots/09-printable-ticket-media-print.png`)
+
+![Printable Ticket Clean Monochrome](screenshots/09-printable-ticket-media-print.png)
+
+#### Systems Engineering Deep-Dive
+- **Zero-Ink Turnstile Printing (`@media print`):**
+  Cinema box-office tickets must print cleanly on paper without burning dark ink or wasting toner on web background gradients. The stylesheet (`app/bookings/[bookingId]/page.tsx` and `app/globals.css`) applies a strict `@media print` query:
+  - Background forced to pure white (`#ffffff`) and text to solid black (`#000000`).
+  - The background ticket photography stub is stripped from the print tree.
+  - Action buttons ("Back to booking", "Print ticket") and navigation bars are hidden (`display: none`).
+  - The resulting output is a clean, crisp, turnstile-scannable admission voucher showing reference, date, seat, and UUID ticket codes.
+
+---
+
+### Screen 10: Late Payment Expiry & Automated Refund (`screenshots/10-hold-expired-refund.png`)
+
+![Late Payment Automated Refund](screenshots/10-hold-expired-refund.png)
+
+#### Systems Engineering Deep-Dive
+- **The Golden Invariant in Action (FR-05):**
+  What happens if an external payment gateway takes 15 seconds to process, but the customer's hold expired at second 10 and another customer claimed the seat at second 11?
+  - Naive systems either overwrite the new customer's seat (double sale) or swallow the payment silently.
+  - SeatRush executes the non-negotiable rule: **Late success never reclaims inventory.**
+  - `applyNotification()` verifies hold liveness under lock. Detecting that the hold expired and seat ownership changed, it marks `payment_attempts.status = 'succeeded'`, inserts a row into `refund_required` with `reason = 'hold_expired'`, and emits a `refund.required` outbox event.
+  - The UI honestly displays: *"The payment was approved after your hold had run out of time, so the seats were not booked. ₹200 has been refunded."*
+  - A 3-step audit stepper tracks the background refund settlement: `Refund recorded` $\rightarrow$ `Refund processing` $\rightarrow$ `Refunded`.
+
+---
+
+### Screen 11: Payment Decline & In-Flight Retry (`screenshots/11-payment-declined-retry.png`)
+
+![Payment Decline and Retry](screenshots/11-payment-declined-retry.png)
+
+#### Systems Engineering Deep-Dive
+- **Hold Survival Across Payment Failures (FR-04):**
+  If a payment card is declined or the simulated provider returns `failure`:
+  - The attempt transitions to `failed` (an absorbing terminal state).
+  - **The hold does not expire.** The five-minute reservation remains active for the customer.
+  - The UI informs the user: *"The provider declined your last payment. Nothing was taken; you can try again while your hold lasts."*
+  - The user can select a different payment scenario and click **"Try again, pay ₹200"** with a fresh payment attempt before the hold clock reaches zero.
 ---
 
 ## 3. Background Processing & Distributed Resilience Patterns
@@ -771,17 +849,18 @@ psql postgresql://seatrush:seatrush@localhost:5433/seatrush
 #### Query 1: Real-Time Seat Inventory Partitioning
 Verify that all 100 seats strictly partition into `available`, `held`, and `confirmed`:
 ```sql
-SELECT 
-  count(*) FILTER (WHERE s.current_hold_id IS NULL AND NOT EXISTS (
-    SELECT 1 FROM booked_seats bs WHERE bs.seat_id = s.id)) AS available,
-  count(*) FILTER (WHERE h.status = 'active' AND h.expires_at > now()) AS actively_held,
-  count(*) FILTER (WHERE EXISTS (
-    SELECT 1 FROM booked_seats bs WHERE bs.seat_id = s.id)) AS confirmed_booked,
-  count(*) AS total_seats
+SELECT
+  count(*) FILTER (WHERE bs.seat_id IS NULL AND NOT live) AS available,
+  count(*) FILTER (WHERE bs.seat_id IS NULL AND live)     AS actively_held,
+  count(*) FILTER (WHERE bs.seat_id IS NOT NULL)          AS confirmed_booked,
+  count(*)                                                AS total_seats
 FROM seats s
-LEFT JOIN holds h ON h.id = s.current_hold_id;
+LEFT JOIN booked_seats bs ON bs.screening_id = s.screening_id AND bs.seat_id = s.id
+LEFT JOIN holds h ON h.id = s.current_hold_id
+CROSS JOIN LATERAL (SELECT COALESCE(h.status = 'active' AND h.expires_at > now(), false) AS live) l
+WHERE s.screening_id = (SELECT id FROM screenings WHERE demo_key = 'demo-screening');
 ```
-*(Expected output: sum of available + actively_held + confirmed_booked must equal exactly 100).*
+*(Expected output: available + actively_held + confirmed_booked must equal exactly 100, correctly treating expired-but-unswept holds as available).*
 
 #### Query 2: Inspect Active Holds with Real Expiry Deadlines
 ```sql

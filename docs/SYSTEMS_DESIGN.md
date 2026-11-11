@@ -44,37 +44,37 @@ SeatRush moves the entire decision into the database kernel using **deterministi
 ```mermaid
 sequenceDiagram
     autonumber
-    box rgba(240, 249, 255, 0.8) "Concurrent Clients"
-        actor Alice as Customer 1 (Alice)
-        actor Bob as Customer 2 (Bob)
+    box "Concurrent API Workers"
+        actor Alice as Worker A (Alice, xid 101)
+        actor Bob as Worker B (Bob, xid 102)
     end
-    box rgba(243, 232, 255, 0.8) "PostgreSQL 18 Kernel (Read Committed)"
-        participant Engine as Transaction Engine
-        participant Row as Seat Row A7 (Inventory)
+    box "PostgreSQL 18 Kernel (Read Committed)"
+        participant PG as Stored Procedure Engine
+        participant Inv as Seats Table (Row A7)
     end
 
-    Alice->>Engine: BEGIN TRANSACTION (xid 101)
-    Bob->>Engine: BEGIN TRANSACTION (xid 102)
+    Alice->>PG: claim_seats(screening, alice, [A7])
     activate Alice
+    Alice->>Inv: PERFORM id FROM seats WHERE id = 'A7'<br/>FOR NO KEY UPDATE
+    activate Inv
+    Note over Inv: Row lock granted to Alice (xid 101)
+
+    Bob->>PG: claim_seats(screening, bob, [A7])
     activate Bob
+    Bob->>Inv: PERFORM id FROM seats WHERE id = 'A7'<br/>FOR NO KEY UPDATE
+    Note over Bob,Inv: Bob BLOCKS on row lock (held by xid 101)
 
-    Alice->>Row: SELECT id FROM seats WHERE id = 'A7'<br/>FOR NO KEY UPDATE
-    activate Row
-    Note over Row: Row lock granted to Alice (xid 101)
-
-    Bob->>Row: SELECT id FROM seats WHERE id = 'A7'<br/>FOR NO KEY UPDATE
-    Note over Bob,Row: Bob BLOCKS on row lock (held by xid 101)
-
-    Alice->>Row: UPDATE seats SET current_hold_id = Alice_Hold<br/>WHERE expires_at <= now()
-    Alice->>Engine: COMMIT
+    Alice->>Inv: UPDATE seats SET current_hold_id = H1
+    Alice->>PG: COMMIT
     deactivate Alice
-    Note over Row: Alice commits. Lock released!
+    Note over Inv: Alice commits. Lock released!
 
-    Note over Bob,Row: PostgreSQL EvalPlanQual (EPQ) re-evaluates Row A7 for Bob.<br/>Row now has current_hold_id != NULL and unexpired!
-    Row-->>Bob: UPDATE matches 0 rows!
-    deactivate Row
-    Note over Bob: Stored procedure raises exception:<br/>SQLSTATE 'SR409' (seat_unavailable)
-    Bob->>Engine: ROLLBACK
+    Note over Bob,Inv: Bob wakes: locking SELECT follows ctid chain.<br/>Row still matches WHERE clause -> Lock granted to Bob!
+    Bob->>Inv: Conflict Probe SELECT (Fresh MVCC Snapshot)
+    Note over Bob,Inv: Read Committed sees Alice's newly committed hold H1!<br/>A7 is currently held and unexpired.
+    deactivate Inv
+    Note over Bob: Stored procedure raises exception:<br/>SQLSTATE 'SR409' (seat conflict: [A7])
+    Bob->>PG: ROLLBACK
     deactivate Bob
 ```
 
@@ -183,34 +183,38 @@ The following ERD models the schema relationships, constraints, and audit tables
 
 ```mermaid
 erDiagram
-    SCREENING ||--|{ SEAT : contains
-    SCREENING ||--o{ HOLD : schedules
-    SCREENING ||--o{ BOOKING : confirms
-    SCREENING ||--o{ DOMAIN_EVENT : tracks
-    SCREENING ||--|| SCREENING_EVENT_CURSOR : serializes
+    SCREENING ||--o{ SEAT : "contains"
+    SCREENING ||--o{ HOLD : "scopes"
+    SCREENING ||--o{ BOOKING : "hosts"
+    SCREENING ||--o{ DOMAIN_EVENT : "emits"
+    SCREENING ||--o| SCREENING_EVENT_CURSOR : "synchronizes"
+    SCREENING ||--o{ IDEMPOTENCY_RECORD : "protects"
 
-    IDENTITY ||--o{ HOLD : reserves
-    IDENTITY ||--o{ BOOKING : owns
-    IDENTITY ||--o{ IDEMPOTENCY_RECORD : scopes
+    IDENTITY ||--o{ HOLD : "reserves"
+    IDENTITY ||--o{ BOOKING : "owns"
+    IDENTITY ||--o{ IDEMPOTENCY_RECORD : "keys"
 
-    HOLD ||--|{ HOLD_ITEM : includes
-    HOLD ||--o| BOOKING : fulfills
-    HOLD ||--o{ PAYMENT_ATTEMPT : funds
-    SEAT ||--o| HOLD : "currently held by"
+    HOLD ||--|{ HOLD_ITEM : "comprises"
+    HOLD ||--o| BOOKING : "finalizes_to"
+    HOLD ||--o{ PAYMENT_ATTEMPT : "bills"
+    SEAT ||--o{ HOLD_ITEM : "held_in"
+    SEAT |o--o| HOLD : "current_hold"
 
-    BOOKING ||--|{ BOOKED_SEAT : issues
-    BOOKING ||--|| PAYMENT_ATTEMPT : "settled by"
-    SEAT ||--o| BOOKED_SEAT : "permanently sold as"
+    BOOKING ||--|{ BOOKED_SEAT : "tickets"
+    SEAT ||--o{ BOOKED_SEAT : "assigned_to"
 
-    PAYMENT_ATTEMPT ||--o{ PAYMENT_EVENT : records
-    PAYMENT_ATTEMPT ||--o| REFUND_REQUIRED : "triggers if late"
+    PAYMENT_ATTEMPT ||--o{ PAYMENT_EVENT : "logs"
+    PAYMENT_ATTEMPT ||--o| REFUND_REQUIRED : "recovers"
+    PAYMENT_ATTEMPT ||--o| BOOKING : "settles"
 
     SCREENING {
         uuid id PK
         string demo_key UK
         string title
         timestamptz starts_at
+        int duration_minutes
         int seat_price_paise
+        timestamptz created_at
     }
 
     SEAT {
@@ -233,22 +237,54 @@ erDiagram
         timestamptz expires_at "created_at + 5min"
     }
 
-    PAYMENT_ATTEMPT {
-        uuid id PK
-        uuid hold_id FK
-        string status "initiated|succeeded|failed"
-        int amount_paise
-        timestamptz created_at
-        timestamptz finalized_at
+    HOLD_ITEM {
+        uuid hold_id PK,FK "Composite PK"
+        uuid seat_id PK,FK "Composite PK"
+        uuid screening_id FK
+        int price_paise
     }
 
     BOOKING {
         uuid id PK
         string reference UK "SR-XXXX"
         uuid hold_id UK,FK
+        uuid screening_id FK
+        uuid customer_id FK
         uuid payment_attempt_id UK,FK
         int amount_paise
         timestamptz confirmed_at
+    }
+
+    BOOKED_SEAT {
+        uuid id PK
+        uuid booking_id FK
+        uuid screening_id FK
+        uuid seat_id FK
+        string ticket_code UK
+        int price_paise
+    }
+
+    PAYMENT_ATTEMPT {
+        uuid id PK
+        uuid hold_id FK
+        string status "initiated|succeeded|failed"
+        int amount_paise
+        string scenario
+        int delay_ms
+        timestamptz created_at
+        timestamptz finalized_at
+    }
+
+    PAYMENT_EVENT {
+        uuid id PK
+        string provider_event_id UK
+        uuid payment_attempt_id FK
+        string outcome
+        jsonb payload
+        string disposition
+        timestamptz received_at
+        timestamptz processed_at
+        boolean duplicate_event_emitted
     }
 
     REFUND_REQUIRED {
@@ -257,25 +293,47 @@ erDiagram
         int amount_paise
         string reason "hold_expired|hold_released"
         string status "required|processing|refunded"
+        timestamptz created_at
+        timestamptz refunded_at
     }
 
     DOMAIN_EVENT {
-        bigserial id PK
+        bigint id PK
         uuid screening_id FK
+        uuid booking_id FK
+        uuid customer_id FK
         string kind "hold.created, booking.confirmed..."
         jsonb payload "Strict event data"
         timestamptz created_at
+        timestamptz published_at
     }
 
     IDEMPOTENCY_RECORD {
         uuid id PK
         uuid customer_id FK
+        uuid screening_id FK
         string operation "POST /holds, etc."
         string key "Client UUID"
         string request_hash "SHA-256"
         string status "in_progress|completed"
+        int response_code
+        jsonb response_body
+        timestamptz created_at
         timestamptz locked_until "30s Lease"
         timestamptz retain_until "24h TTL"
+    }
+
+    SCREENING_EVENT_CURSOR {
+        uuid screening_id PK,FK
+        bigint last_event_id
+    }
+
+    IDENTITY {
+        uuid id PK
+        string demo_key UK
+        string display_name
+        string role
+        timestamptz created_at
     }
 ```
 
@@ -308,8 +366,9 @@ SeatRush demonstrates the superior pattern for inventory systems: **Read Committ
 If Transaction 1 locks Seat 5 then Seat 6, while Transaction 2 locks Seat 6 then Seat 5, PostgreSQL halts both and throws `40P01` (`deadlock_detected`), killing one transaction.
 
 SeatRush demonstrates **Total Resource Ordering**:
-Every SQL procedure sorting multi-seat operations enforces deterministic UUID sorting (`ORDER BY id ASC`). Combined with a strict global lock ladder (`screening -> idempotency -> customer -> holds -> seats -> cursor`), deadlocks are mathematically eliminated.
-
+The lock ladder is a **global partial ordering**; each operation acquires a deterministic *ordered subset* of the ladder:
+$$\text{screening} \xrightarrow{\text{KEY SHARE}} \text{idempotency} \xrightarrow{\text{FOR UPDATE}} \text{identity} \xrightarrow{\text{NO KEY UPDATE}} \text{holds by ID} \xrightarrow{\text{NO KEY UPDATE}} \text{seats by ID} \xrightarrow{\text{NO KEY UPDATE}} \text{payment\_attempts} \xrightarrow{\text{FOR UPDATE}} \text{refund\_required} \xrightarrow{\text{FOR UPDATE}} \text{event cursor} \xrightarrow{\text{FOR UPDATE}}$$
+Because every transaction moves strictly *down* the hierarchy, circular wait-for dependency graphs are mathematically impossible. Operations like `reset_demo_screening` safely deviate because they acquire an exclusive `screenings FOR UPDATE` lock, locking out all concurrent writers at Rung 1.
 👉 *Read full analysis:* [`docs/SYSTEMS_CONCURRENCY_DEEP_DIVE.md` (Section 3)](#6-deep-dive-documentation-index)
 
 ### 3. Absorbing State Machines in Distributed Payments
@@ -318,16 +377,27 @@ SeatRush models payment attempts as an **absorbing state machine**:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> initiated: Customer clicks Pay
-    initiated --> succeeded: Webhook arrives (Valid Hold)
-    initiated --> failed: Provider declines
-    initiated --> refund_required: Webhook arrives (Hold Expired/Released)
-
-    succeeded --> [*]: Absorbing Final (Immutable)
-    failed --> [*]: Absorbing Final (Immutable)
-    refund_required --> refunded: Worker 2-Phase Settlement
-    refunded --> [*]: Absorbing Final (Immutable)
+    direction LR
+    state "payment_attempts.status" as PA {
+        [*] --> initiated: POST /holds/:id/payments<br/>(guard_initial_payment)
+        initiated --> failed: Webhook outcome = 'failed'
+        initiated --> succeeded: Webhook outcome = 'succeeded'
+        failed --> [*]: Absorbing Final (guard_payment_transition)
+        succeeded --> [*]: Absorbing Final (guard_payment_transition)
+    }
 ```
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "refund_required.status (2-Phase Recovery)" as RR {
+        [*] --> required: Succeeded on expired/released hold<br/>(guard_refund_required)
+        required --> processing: Worker phase 1 (committed)
+        processing --> refunded: Worker phase 2 (refunded_at set)
+        refunded --> [*]: Terminal State
+    }
+```
+
+A `succeeded` attempt yields exactly one of a confirmed `bookings` row or a `refund_required` row. `prepare_booking` refuses attempts that already have a refund record, and `guard_refund_required` refuses attempts that are already booked.
 
 Once in `succeeded` or `failed`, the state can *never* move backwards. If a `processing` notice arrives late after `succeeded`, it is safely ignored.
 
@@ -390,23 +460,44 @@ The user selects how the simulated payment provider should behave. This allows d
 ---
 
 ### Step 6: Handling High-Contention Conflicts (409)
-If a competing customer claims a seat while you are choosing it, the atomic update rejects the claim with `409 Conflict`. The UI marks the contested seat with a dashed outline while preserving your remaining selections.
+The user selects seats E4 and E5. Meanwhile, another customer claims seat E5 via the API. When the user clicks "Hold 2 seats", the atomic reservation rejects the contested seat with `409 Conflict`. Seat E5 is marked with a dashed hourglass (`Held by another customer`), while seat E4 remains chosen in yellow, allowing the user to immediately hold E4 without starting over.
 
 ![Seat Conflict 409](screenshots/06-seat-conflict-409.png)
 
 ---
 
 ### Step 7: Booking Confirmation & Ticket Stub
-When payment succeeds on a valid hold, the atomic booking transaction confirms ownership, generates a unique booking reference (`SR-...`) and ticket codes, and renders an overlaid ticket stub.
+The user holds seat E4 and submits payment with the "Approve" scenario. The atomic booking transaction confirms ownership, generates unique booking reference `SR-BABD42EE3A104660A2BEC8D211765352` and ticket code `80ae6d40-5ceb-4f3b-a9ff-c05555edfbf7`, and renders the ticket-stub overlay.
 
 ![Booking Confirmed](screenshots/07-booking-confirmed.png)
 
 ---
 
-### Step 8: Dedicated Printable Ticket
-The customer can view their ticket at `/bookings/[bookingId]`. When printed or saved to PDF, the stylesheet automatically switches to clean black-and-white print media formatting.
+### Step 8: Dedicated Printable Ticket (Web View)
+The customer can view their ticket at `/bookings/[bookingId]`. The route is owner-authenticated and provides full show and seat details.
 
 ![Printable Ticket](screenshots/08-printable-ticket.png)
+
+---
+
+### Step 9: Zero-Ink Print Media Voucher (`@media print`)
+When printed or saved to PDF via browser print dialogue, the stylesheet strips dark backgrounds and heavy graphics, producing a clean, high-contrast admission voucher for theater turnstiles.
+
+![Print Media Voucher](screenshots/09-printable-ticket-media-print.png)
+
+---
+
+### Step 10: Late Payment Expiry & Automated Refund (FR-05)
+If a payment notification arrives after the 5-minute hold expired and the seat was reassigned to someone else, the system enforces the golden rule: **late success never reclaims inventory**. The transaction automatically creates a `refund_required` record, and a 3-step audit stepper tracks automated refund settlement.
+
+![Late Payment Automated Refund](screenshots/10-hold-expired-refund.png)
+
+---
+
+### Step 11: Payment Decline & In-Flight Retry (FR-04)
+If the simulated provider declines payment (`failure`), the attempt is marked `failed` while the hold countdown continues uninterrupted. The customer can select a new scenario and click "Try again, pay ₹200" before the hold deadline.
+
+![Payment Decline and Retry](screenshots/11-payment-declined-retry.png)
 
 ---
 
@@ -431,14 +522,19 @@ Want to verify these systems principles for yourself? Run these commands in your
 ### 1. Inspect Live Inventory Partitioning
 Connect to PostgreSQL and verify that all 100 seats partition cleanly without overlaps:
 
-```bash
-PGPASSWORD=seatrush psql -h localhost -p 5433 -U seatrush -d seatrush -c "
-SELECT 
-  (SELECT count(*) FROM seats WHERE current_hold_id IS NULL AND id NOT IN (SELECT seat_id FROM booked_seats)) AS available,
-  (SELECT count(*) FROM holds WHERE status = 'active' AND expires_at > now()) AS active_holds,
-  (SELECT count(*) FROM booked_seats) AS confirmed_tickets;
-"
+```sql
+SELECT
+  count(*) FILTER (WHERE bs.seat_id IS NULL AND NOT live) AS available,
+  count(*) FILTER (WHERE bs.seat_id IS NULL AND live)     AS actively_held,
+  count(*) FILTER (WHERE bs.seat_id IS NOT NULL)          AS confirmed_booked,
+  count(*)                                                AS total_seats
+FROM seats s
+LEFT JOIN booked_seats bs ON bs.screening_id = s.screening_id AND bs.seat_id = s.id
+LEFT JOIN holds h ON h.id = s.current_hold_id
+CROSS JOIN LATERAL (SELECT COALESCE(h.status = 'active' AND h.expires_at > now(), false) AS live) l
+WHERE s.screening_id = (SELECT id FROM screenings WHERE demo_key = 'demo-screening');
 ```
+*(Expected output: available + actively_held + confirmed_booked must equal exactly 100, correctly treating expired-but-unswept holds as available).*
 
 ### 2. Fire 50 Concurrent Claims at a Single Seat (The Thundering Herd)
 Run the automated Vitest concurrency test to watch 50 parallel requests hit seat A7 simultaneously:
